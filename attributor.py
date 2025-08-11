@@ -617,6 +617,82 @@ def write_qa_report(segments: List[TranscriptSegment], timeline: List[SpeakerEve
     out_path.write_text(json.dumps(coverage, indent=2), encoding="utf-8")
 
 
+
+# ----------------------------- Interactive Prompts -----------------------------
+
+def _try_tk():
+    try:
+        import tkinter as _tk  # type: ignore
+        from tkinter import filedialog as _fd  # type: ignore
+        return _tk, _fd
+    except Exception:
+        return None, None
+
+def _prompt_path_console(label: str, is_dir: bool = False) -> Path:
+    print(f"[INPUT] {label} (you can drag the file/folder into this window and press Enter)")
+    while True:
+        raw = input("> ").strip().strip('"').strip("'")
+        if not raw:
+            print("Please provide a path.")
+            continue
+        path = Path(raw).expanduser().resolve()
+        if is_dir and path.is_dir():
+            return path
+        if not is_dir and path.is_file():
+            return path
+        print(f"Path not valid as {'directory' if is_dir else 'file'}: {path}")
+
+def _prompt_path_gui(label: str, is_dir: bool = False, filetypes=None) -> Optional[Path]:
+    _tk, _fd = _try_tk()
+    if not _tk:
+        return None
+    try:
+        root = _tk.Tk()
+        root.withdraw()
+        path_str = ""
+        if is_dir:
+            path_str = _fd.askdirectory(title=label) or ""
+        else:
+            path_str = _fd.askopenfilename(title=label, filetypes=filetypes or [("All files", "*.*")]) or ""
+        root.update_idletasks()
+        root.destroy()
+        if path_str:
+            return Path(path_str).expanduser().resolve()
+    except Exception:
+        return None
+    return None
+
+def prompt_paths_interactive(args) -> Tuple[Path, Path, Path, Path]:
+    """
+    Prompt user to select video, screenshot, ics, and output directory.
+    Supports GUI via Tkinter if available; else console prompt that accepts drag-and-drop.
+    """
+    video = args.video if isinstance(args.video, Path) else None
+    screenshot = args.screenshot if isinstance(args.screenshot, Path) else None
+    ics = args.ics if isinstance(args.ics, Path) else None
+    outdir = args.outdir if isinstance(args.outdir, Path) else None
+
+    # Video
+    if not video:
+        video = _prompt_path_gui("Select meeting video (mp4/mkv/etc.)",
+                                 filetypes=[("Video", "*.mp4 *.mkv *.mov *.avi"), ("All", "*.*")]) \
+                or _prompt_path_console("Drop meeting video path")
+    # Screenshot
+    if not screenshot:
+        screenshot = _prompt_path_gui("Select meeting grid screenshot (PNG/JPG)",
+                                      filetypes=[("Images", "*.png *.jpg *.jpeg"), ("All", "*.*")]) \
+                    or _prompt_path_console("Drop screenshot path")
+    # ICS
+    if not ics:
+        ics = _prompt_path_gui("Select meeting .ics file", filetypes=[("ICS", "*.ics"), ("All", "*.*")]) \
+              or _prompt_path_console("Drop .ics path")
+    # Outdir
+    if not outdir:
+        outdir = _prompt_path_gui("Select output directory", is_dir=True) \
+                 or _prompt_path_console("Drop output directory", is_dir=True)
+
+    return video, screenshot, ics, outdir
+
 # ----------------------------- Orchestrator -----------------------------
 
 def process_meeting(video: Path, screenshot: Path, ics: Path, outdir: Path, stt_prefers_faster: bool, stt_model: str, fps: float) -> Dict[str, str]:
@@ -661,6 +737,7 @@ def process_meeting(video: Path, screenshot: Path, ics: Path, outdir: Path, stt_
 
 def main():
     p = argparse.ArgumentParser(description="Offline Teams meeting speaker attribution & transcription")
+    p.add_argument("--interactive", action="store_true", help="Prompt for paths (GUI if available; console otherwise)")
     p.add_argument("--video", type=Path, required=True, help="Path to meeting video (mp4/mkv/etc.)")
     p.add_argument("--screenshot", type=Path, required=True, help="High-res grid screenshot with names visible")
     p.add_argument("--ics", type=Path, required=True, help="Meeting .ics file with attendees")
@@ -669,6 +746,10 @@ def main():
     p.add_argument("--stt-model", type=str, default="medium", help="STT model size (small/base/medium/large)")
     p.add_argument("--prefer-faster", action="store_true", help="Prefer faster-whisper if available")
     args = p.parse_args()
+
+    # If interactive or any required path is missing, prompt one-by-one
+    if args.interactive or not all([args.video, args.screenshot, args.ics, args.outdir]):
+        args.video, args.screenshot, args.ics, args.outdir = prompt_paths_interactive(args)
 
     try:
         outputs = process_meeting(
