@@ -38,9 +38,6 @@ External tools:
     - ffmpeg (in PATH)
     - Tesseract OCR binary (in PATH); or set TESSERACT_CMD or --tesseract-cmd
 
-Author: ChatGPT (offline-ready V2-multithread)
-License: MIT
-"""
 from __future__ import annotations
 
 import argparse
