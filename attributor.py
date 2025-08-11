@@ -105,7 +105,7 @@ class FasterWhisperEngine(STTEngine):
         self.model = WhisperModel(model_size, device=device or "auto")
 
     def transcribe(self, audio_path: Path) -> List[Dict]:
-        segments, _ = self.model.transcribe(str(audio_path), vad_filter=True)
+        segments, _ = self.model.transcribe(str(audio_path), vad_filter=True, language="en")
         out = []
         for seg in segments:
             out.append({
@@ -127,7 +127,7 @@ class OpenAIWhisperEngine(STTEngine):
 
     def transcribe(self, audio_path: Path) -> List[Dict]:
         import whisper  # type: ignore
-        result = self.model.transcribe(str(audio_path), verbose=False)
+        result = self.model.transcribe(str(audio_path), verbose=False, language="en")
         out = []
         for seg in result.get("segments", []):
             out.append({
