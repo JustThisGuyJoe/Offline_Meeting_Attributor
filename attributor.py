@@ -253,7 +253,7 @@ def parse_ics_attendees(ics_path: Path) -> Dict[str, str]:
     for comp in cal.walk():
         if comp.name == "VEVENT":
             # Organizer (optional)
-            org = comp.get("ORGANIZER")
+            org = comp.get("ORGANIZER") or comp.get("organizer")
             if org:
                 val = str(org)
                 # ORGANIZER;CN=Name:mailto:email
@@ -263,11 +263,25 @@ def parse_ics_attendees(ics_path: Path) -> Dict[str, str]:
                 company = domain_to_company(email_m.group(1)) if email_m else ""
                 if cn:
                     attendees[cn] = company or attendees.get(cn, "")
-            # Attendees
-            for att in comp.getall("ATTENDEE"):
+
+            # Attendees (icalendar stores as 'attendee' value or list; no .getall on Event)
+            raw_atts = comp.get("attendee") or comp.get("ATTENDEE") or []
+            if not isinstance(raw_atts, list):
+                raw_atts = [raw_atts]
+
+            for att in raw_atts:
+                # Prefer params when available
+                cn = None
+                try:
+                    params = getattr(att, "params", {})
+                    if params and "CN" in params:
+                        cn = str(params["CN"]).strip()
+                except Exception:
+                    pass
                 sval = str(att)
-                m = re.search(r"CN=([^:;]+)", sval)
-                cn = m.group(1).strip() if m else None
+                if not cn:
+                    m = re.search(r"CN=([^:;]+)", sval)
+                    cn = m.group(1).strip() if m else None
                 email_m = re.search(r"mailto:([^>\s]+)", sval, re.I)
                 company = domain_to_company(email_m.group(1)) if email_m else ""
                 if cn:
