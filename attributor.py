@@ -1,50 +1,44 @@
 #!/usr/bin/env python3
 """
-offline_meeting_attributor.py
+offline_meeting_attributor_V2_multithread.py
 
 Purpose:
-    Offline pipeline to generate a speaker-attributed transcript from a Teams-style meeting video,
-    using blue-border active speaker detection plus audio transcription. Designed for GPU-enabled
-    Python environments and fully offline usage.
+    GPU-friendly, fully offline pipeline to generate a speaker-attributed transcript from a
+    Teams-style meeting video, using blue-border active speaker detection + audio transcription.
+    This V2-multithread build adds interactive prompting, CUDA controls, language forcing,
+    robust .ics parsing, and multithreaded border detection.
 
 Key features:
-    - Parses a .ics meeting invite to derive attendee names and (best-effort) company affiliations.
-    - Parses a high-res meeting grid screenshot to build a tile map of participant names & positions.
-    - Scans the meeting video for "blue border" rectangles around tiles to determine active speaker
-      over time; robust to curved/wide monitors by allowing relaxed color/shape thresholds.
-    - Transcribes audio locally (faster-whisper if available, else openai-whisper as fallback).
-    - Aligns transcription segments to the active-speaker timeline to attribute lines to speakers.
-    - Applies strict vocabulary normalization rules (ephOut, SATNO, Omitron, ephemeris) with
-      whole-word & case-aware replacements.
+    - Interactive mode: prompts for video/screenshot/.ics/outdir (GUI picker if Tkinter available;
+      console fallback supports drag-and-drop paths).
+    - Parses .ics attendee names + infers company from email domain (e.g., omitron.com -> Omitron).
+    - OCRs high-res grid screenshot to map participant tiles & name bboxes (Tesseract).
+    - Detects blue-border active speaker from sampled frames; tolerant of curved monitors.
+    - Multithreaded frame processing for border detection (single reader, threaded compute).
+    - Transcribes audio locally (prefers faster-whisper on CUDA; openai-whisper fallback).
+    - CLI flags for device (auto/cuda/cpu), compute-type, workers, cpu threads, and language.
+    - Vocabulary normalization: ephOut, SATNO, Omitron, ephemeris.
     - Outputs:
-        * speaker_attributed.vtt (WebVTT with speakers; "*" marks visually validated speakers)
-        * transcript_segments.json (machine-readable segments with timing & speakers)
-        * qa_report.json (attribution coverage & confidence metrics)
+        * speaker_attributed.vtt
+        * transcript_segments.json
+        * qa_report.json
 
-Design constraints:
-    - DRY, SOLID-ish structure: small, testable classes; dependency injection for STT engine.
-    - Clear naming, minimal docstrings; robust error messages (no silent failure).
-    - Avoid deep nesting; prefer composition; keep optimization modest & safe.
+CLI example:
+    python offline_meeting_attributor_V2_multithread.py --interactive \
+      --prefer-faster --device cuda --compute-type float16 --whisper-workers 2 \
+      --video-workers 4 --lang en
 
-CLI:
-    python offline_meeting_attributor.py \
-        --video path/to/meeting.mp4 \
-        --screenshot path/to/grid.png \
-        --ics path/to/meeting.ics \
-        --outdir path/to/output \
-        --fps 2
-
-Dependencies (install as needed):
-    pip install opencv-python numpy pillow rapidfuzz icalendar python-dateutil
-    pip install pytesseract # requires Tesseract OCR installed on system
-    pip install faster-whisper  # preferred (GPU)
-    # or: pip install openai-whisper  # CPU/GPU depending on build
+Dependencies:
+    pip install opencv-python numpy pillow rapidfuzz icalendar python-dateutil pytesseract
+    pip install faster-whisper  # preferred for GPU
+    # optional fallback:
+    pip install openai-whisper
 
 External tools:
-    - ffmpeg in PATH (for audio track extraction if needed)
-    - Tesseract OCR binary installed & in PATH (or set TESSERACT_CMD env)
+    - ffmpeg (in PATH)
+    - Tesseract OCR binary (in PATH); or set TESSERACT_CMD or --tesseract-cmd
 
-Author: ChatGPT (offline-ready conversion for user's local stack)
+Author: ChatGPT (offline-ready V2-multithread)
 License: MIT
 """
 from __future__ import annotations
@@ -65,47 +59,54 @@ from typing import Dict, List, Optional, Tuple
 # Optional heavy deps — loaded lazily
 try:
     import cv2  # type: ignore
-except Exception as e:  # pragma: no cover
+except Exception:
     cv2 = None
 try:
     import numpy as np  # type: ignore
-except Exception as e:  # pragma: no cover
+except Exception:
     np = None
 try:
-    from PIL import Image
-except Exception as e:  # pragma: no cover
+    from PIL import Image  # noqa: F401
+except Exception:
     Image = None
 try:
     import pytesseract  # type: ignore
-except Exception as e:  # pragma: no cover
+except Exception:
     pytesseract = None
 try:
     from icalendar import Calendar  # type: ignore
-except Exception as e:  # pragma: no cover
+except Exception:
     Calendar = None
 try:
     from rapidfuzz import fuzz, process as rf_process  # type: ignore
-except Exception as e:  # pragma: no cover
+except Exception:
     fuzz = None
     rf_process = None
 
-# STT providers are injected via factory below.
+# ----------------------------- STT Engines -----------------------------
 class STTEngine:
     """Abstract STT engine interface."""
-    def transcribe(self, audio_path: Path) -> List[Dict]:
+    def transcribe(self, audio_path: Path, language: Optional[str] = None) -> List[Dict]:
         raise NotImplementedError
 
-
 class FasterWhisperEngine(STTEngine):
-    def __init__(self, model_size: str = "medium", device: Optional[str] = None):
+    def __init__(self, model_size: str = "medium", device: Optional[str] = None,
+                 compute_type: str = "float16", cpu_threads: int = 0, num_workers: int = 1):
         try:
             from faster_whisper import WhisperModel  # type: ignore
         except Exception as e:
             raise RuntimeError("faster-whisper not installed. pip install faster-whisper") from e
-        self.model = WhisperModel(model_size, device=device or "auto")
+        self.model = WhisperModel(model_size,
+                                  device=device or "auto",
+                                  compute_type=compute_type,
+                                  cpu_threads=cpu_threads,
+                                  num_workers=num_workers)
 
-    def transcribe(self, audio_path: Path) -> List[Dict]:
-        segments, _ = self.model.transcribe(str(audio_path), vad_filter=True, language="en")
+    def transcribe(self, audio_path: Path, language: Optional[str] = None) -> List[Dict]:
+        kwargs = {"vad_filter": True}
+        if language:
+            kwargs["language"] = language
+        segments, _ = self.model.transcribe(str(audio_path), **kwargs)
         out = []
         for seg in segments:
             out.append({
@@ -116,18 +117,22 @@ class FasterWhisperEngine(STTEngine):
             })
         return out
 
-
 class OpenAIWhisperEngine(STTEngine):
     def __init__(self, model_size: str = "medium"):
         try:
             import whisper  # type: ignore
         except Exception as e:
             raise RuntimeError("openai-whisper not installed. pip install openai-whisper") from e
-        self.model = whisper.load_model(model_size)
+        import torch  # type: ignore
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.model = whisper.load_model(model_size, device=device)
 
-    def transcribe(self, audio_path: Path) -> List[Dict]:
+    def transcribe(self, audio_path: Path, language: Optional[str] = None) -> List[Dict]:
         import whisper  # type: ignore
-        result = self.model.transcribe(str(audio_path), verbose=False, language="en")
+        kwargs = {"verbose": False}
+        if language:
+            kwargs["language"] = language
+        result = self.model.transcribe(str(audio_path), **kwargs)
         out = []
         for seg in result.get("segments", []):
             out.append({
@@ -138,12 +143,15 @@ class OpenAIWhisperEngine(STTEngine):
             })
         return out
 
-
-def stt_factory(prefer_faster: bool = True, model_size: str = "medium") -> STTEngine:
+def stt_factory(prefer_faster: bool = True, model_size: str = "medium",
+                device: str = "auto", compute_type: str = "float16",
+                cpu_threads: int = 0, num_workers: int = 1) -> STTEngine:
     """Choose best available STT engine with clear errors otherwise."""
     if prefer_faster:
         try:
-            return FasterWhisperEngine(model_size=model_size)
+            return FasterWhisperEngine(model_size=model_size, device=device,
+                                       compute_type=compute_type, cpu_threads=cpu_threads,
+                                       num_workers=num_workers)
         except Exception:
             pass
     try:
@@ -153,15 +161,12 @@ def stt_factory(prefer_faster: bool = True, model_size: str = "medium") -> STTEn
             "No STT engine available. Install faster-whisper or openai-whisper."
         ) from e
 
-
 # ----------------------------- Data Models -----------------------------
-
 @dataclass
 class Tile:
     name: str
     bbox: Tuple[int, int, int, int]  # x, y, w, h
     grid_pos: Tuple[int, int]  # row, col
-
 
 @dataclass
 class SpeakerEvent:
@@ -169,7 +174,6 @@ class SpeakerEvent:
     end: float
     tile_name: str  # raw name from screenshot OCR
     validated: bool  # True if blue-border detected
-
 
 @dataclass
 class TranscriptSegment:
@@ -180,14 +184,11 @@ class TranscriptSegment:
     validated: bool = False
     prob: Optional[float] = None
 
-
 # ----------------------------- Utilities -----------------------------
-
 def run_ffmpeg_extract_audio(video: Path, out_wav: Path, sample_rate: int = 16000) -> None:
     """Extract mono WAV via ffmpeg for STT."""
     cmd = [
-        "ffmpeg",
-        "-y",
+        "ffmpeg", "-y",
         "-i", str(video),
         "-ac", "1",
         "-ar", str(sample_rate),
@@ -197,7 +198,6 @@ def run_ffmpeg_extract_audio(video: Path, out_wav: Path, sample_rate: int = 1600
     if proc.returncode != 0:
         raise RuntimeError(f"ffmpeg failed: {proc.stderr.decode('utf-8', errors='ignore')}")
 
-
 def hhmmss(seconds: float) -> str:
     td = timedelta(seconds=float(max(0.0, seconds)))
     total_seconds = int(td.total_seconds())
@@ -206,7 +206,6 @@ def hhmmss(seconds: float) -> str:
     m = (total_seconds % 3600) // 60
     s = total_seconds % 60
     return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
-
 
 def ensure_deps():
     missing = []
@@ -225,9 +224,7 @@ def ensure_deps():
     if missing:
         raise RuntimeError(f"Missing dependencies: {', '.join(missing)}")
 
-
 # ----------------------------- ICS Parsing -----------------------------
-
 def parse_ics_attendees(ics_path: Path) -> Dict[str, str]:
     """
     Parse attendee names from .ics. Returns dict mapping display-name -> company (best guess).
@@ -246,8 +243,7 @@ def parse_ics_attendees(ics_path: Path) -> Dict[str, str]:
             base = dom.split(".")[0]
         else:
             base = dom
-        # Normalize common company stylings
-        mapping = {"omitron": "Omitron"}
+        mapping = {"omitron": "Omitron"}  # normalize
         return mapping.get(base, base.capitalize())
 
     for comp in cal.walk():
@@ -256,7 +252,6 @@ def parse_ics_attendees(ics_path: Path) -> Dict[str, str]:
             org = comp.get("ORGANIZER") or comp.get("organizer")
             if org:
                 val = str(org)
-                # ORGANIZER;CN=Name:mailto:email
                 m = re.search(r"CN=([^:;]+)", val)
                 cn = m.group(1).strip() if m else None
                 email_m = re.search(r"mailto:([^>\s]+)", val, re.I)
@@ -264,13 +259,12 @@ def parse_ics_attendees(ics_path: Path) -> Dict[str, str]:
                 if cn:
                     attendees[cn] = company or attendees.get(cn, "")
 
-            # Attendees (icalendar stores as 'attendee' value or list; no .getall on Event)
+            # Attendees can be list or single value; no .getall
             raw_atts = comp.get("attendee") or comp.get("ATTENDEE") or []
             if not isinstance(raw_atts, list):
                 raw_atts = [raw_atts]
 
             for att in raw_atts:
-                # Prefer params when available
                 cn = None
                 try:
                     params = getattr(att, "params", {})
@@ -286,17 +280,22 @@ def parse_ics_attendees(ics_path: Path) -> Dict[str, str]:
                 company = domain_to_company(email_m.group(1)) if email_m else ""
                 if cn:
                     attendees[cn] = company or attendees.get(cn, "")
-    # Apply vocabulary rule normalization for Omitron spelling
+
+    # Enforce Omitron spelling
     norm = {}
     for name, compy in attendees.items():
         compy = "Omitron" if compy.lower() == "omitron" else compy
         norm[name] = compy
     return norm
 
+# ----------------------------- OCR & Grid -----------------------------
+def set_tesseract_cmd_if_provided(tesseract_cmd: Optional[str]):
+    if pytesseract is None:
+        raise RuntimeError("pytesseract is not installed. pip install pytesseract")
+    if tesseract_cmd:
+        pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
 
-# ----------------------------- Screenshot OCR & Grid -----------------------------
-
-def ocr_names_from_screenshot(screenshot_path: Path) -> List[Tuple[str, Tuple[int, int, int, int]]]:
+def ocr_names_from_screenshot(screenshot_path: Path, tesseract_cmd: Optional[str] = None) -> List[Tuple[str, Tuple[int, int, int, int]]]:
     """
     Return list of (name, bbox) for tiles detected in the meeting screenshot.
     Heuristic:
@@ -304,18 +303,18 @@ def ocr_names_from_screenshot(screenshot_path: Path) -> List[Tuple[str, Tuple[in
       - Use OpenCV contour detection to find name ribbons near tile bottoms.
       - Apply Tesseract OCR on these regions.
     """
+    set_tesseract_cmd_if_provided(tesseract_cmd)
+
     img = cv2.imread(str(screenshot_path))
     if img is None:
         raise RuntimeError(f"Failed to read screenshot: {screenshot_path}")
     h, w = img.shape[:2]
 
-    # Preprocess
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (3, 3), 0)
     thr = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
                                 cv2.THRESH_BINARY_INV, 21, 10)
 
-    # Find contours – candidate name areas (heuristic: wide + short near bottom of tiles)
     contours, _ = cv2.findContours(thr, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     candidates = []
     for c in contours:
@@ -324,12 +323,10 @@ def ocr_names_from_screenshot(screenshot_path: Path) -> List[Tuple[str, Tuple[in
         area = cw * ch
         if area < 500 or aspect < 2.5:
             continue
-        # Restrict to lower 70% of image (names usually bottom)
         if y < h * 0.3:
             continue
         candidates.append((x, y, cw, ch))
 
-    # Merge overlapping candidates
     merged = []
     for x, y, cw, ch in sorted(candidates, key=lambda b: b[0]):
         if not merged:
@@ -337,7 +334,6 @@ def ocr_names_from_screenshot(screenshot_path: Path) -> List[Tuple[str, Tuple[in
         else:
             mx1, my1, mx2, my2 = merged[-1]
             if x <= mx2 + 10 and y <= my2 + 10 and (x + cw) >= mx1 - 10:
-                # Merge
                 merged[-1] = [min(mx1, x), min(my1, y), max(mx2, x + cw), max(my2, y + ch)]
             else:
                 merged.append([x, y, x + cw, y + ch])
@@ -347,7 +343,6 @@ def ocr_names_from_screenshot(screenshot_path: Path) -> List[Tuple[str, Tuple[in
         roi = img[my1:my2, mx1:mx2]
         if roi.size == 0:
             continue
-        # OCR
         config = "--psm 7"
         text = pytesseract.image_to_string(roi, config=config)
         text = re.sub(r"[\r\n]+", " ", text).strip()
@@ -356,15 +351,13 @@ def ocr_names_from_screenshot(screenshot_path: Path) -> List[Tuple[str, Tuple[in
         results.append((text, (mx1, my1, mx2 - mx1, my2 - my1)))
     return results
 
-
 def build_grid_from_names(name_bboxes: List[Tuple[str, Tuple[int, int, int, int]]]) -> List[Tile]:
     """Assign grid positions to tiles by sorting by y then x; name normalization applied."""
     if not name_bboxes:
         return []
-    # Sort by y then x to approximate grid placement
     name_bboxes_sorted = sorted(name_bboxes, key=lambda x: (x[1][1], x[1][0]))
     rows: List[List[Tuple[str, Tuple[int, int, int, int]]]] = []
-    row_threshold = 50  # vertical clustering tolerance
+    row_threshold = 50
     for name, bbox in name_bboxes_sorted:
         x, y, w, h = bbox
         if not rows:
@@ -375,7 +368,6 @@ def build_grid_from_names(name_bboxes: List[Tuple[str, Tuple[int, int, int, int]
             rows[-1].append((name, bbox))
         else:
             rows.append([(name, bbox)])
-    # Assign grid positions
     tiles: List[Tile] = []
     for r_idx, row in enumerate(rows):
         row_sorted = sorted(row, key=lambda x: x[1][0])
@@ -384,23 +376,15 @@ def build_grid_from_names(name_bboxes: List[Tuple[str, Tuple[int, int, int, int]
             tiles.append(Tile(name=clean, bbox=bbox, grid_pos=(r_idx, c_idx)))
     return tiles
 
-
 # ----------------------------- Blue Border Detection -----------------------------
-
 def detect_blue_border_regions(frame: "np.ndarray") -> List[Tuple[int, int, int, int]]:
     """
     Detect blue-ish rectangular borders in a frame. Returns bounding boxes.
-    Approach:
-      - Convert to HSV; threshold for blue hue range (tolerant/curved screens).
-      - Morph close regions; find contours; keep rectangular-ish shapes with thin strokes.
     """
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    # Liberal blue ranges (two ranges to cover wrap-around)
     lower1 = np.array([90, 50, 50])
     upper1 = np.array([130, 255, 255])
     mask1 = cv2.inRange(hsv, lower1, upper1)
-
-    # Morph to connect edges
     kernel = np.ones((3, 3), np.uint8)
     mask = cv2.morphologyEx(mask1, cv2.MORPH_CLOSE, kernel, iterations=2)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -408,19 +392,16 @@ def detect_blue_border_regions(frame: "np.ndarray") -> List[Tuple[int, int, int,
     boxes = []
     for cnt in contours:
         x, y, w, h = cv2.boundingRect(cnt)
-        perim = cv2.arcLength(cnt, True)
         area = cv2.contourArea(cnt)
         if w < 40 or h < 40:
             continue
         if area < 200:
             continue
-        # Prefer elongated border rectangles (thin-ish)
         stroke_ratio = area / max(1.0, w * h)
         if stroke_ratio > 0.25:
             continue
         boxes.append((x, y, w, h))
     return boxes
-
 
 def match_boxes_to_tiles(boxes: List[Tuple[int, int, int, int]], tiles: List[Tile]) -> Optional[Tile]:
     """Choose the tile whose bbox overlaps the blue border box the most (IoU)."""
@@ -450,64 +431,71 @@ def match_boxes_to_tiles(boxes: List[Tuple[int, int, int, int]], tiles: List[Til
             if i > best_iou:
                 best_iou = i
                 best = t
-    # Require minimal overlap confidence
     return best if best_iou >= 0.05 else None
 
+def build_active_speaker_timeline(video_path: Path, tiles: List[Tile], fps: float = 2.0,
+                                  video_workers: int = 4) -> List[SpeakerEvent]:
+    """
+    Sample frames; detect blue border concurrently; map to tile; return merged intervals.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
-def build_active_speaker_timeline(video_path: Path, tiles: List[Tile], fps: float = 2.0) -> List[SpeakerEvent]:
-    """
-    Sample frames at FPS; detect blue border; map to tile; return merged timeline intervals.
-    """
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise RuntimeError(f"Failed to open video: {video_path}")
 
     native_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    duration = total_frames / max(1.0, native_fps)
-
     step = int(max(1, round(native_fps / max(0.1, fps))))
-    idx = 0
-    time_s = 0.0
-    raw_events: List[SpeakerEvent] = []
 
-    while True:
-        ret = cap.grab()
-        if not ret:
-            break
-        if idx % step == 0:
-            ret, frame = cap.retrieve()
-            if not ret or frame is None:
+    # Read frames sequentially; dispatch detection
+    idx = 0
+    jobs = []
+    with ThreadPoolExecutor(max_workers=max(1, video_workers)) as ex:
+        while True:
+            ret = cap.grab()
+            if not ret:
                 break
-            time_s = idx / native_fps
-            boxes = detect_blue_border_regions(frame)
+            if idx % step == 0:
+                ret, frame = cap.retrieve()
+                if not ret or frame is None:
+                    break
+                ts = idx / native_fps
+                jobs.append(ex.submit(_detect_one_frame, ts, frame))
+            idx += 1
+
+        # Collect results
+        raw_events: List[SpeakerEvent] = []
+        for fut in as_completed(jobs):
+            ts, boxes = fut.result()
             matched = match_boxes_to_tiles(boxes, tiles)
             if matched is not None:
-                raw_events.append(SpeakerEvent(
-                    start=time_s, end=time_s, tile_name=matched.name, validated=True
-                ))
-        idx += 1
+                raw_events.append(SpeakerEvent(start=ts, end=ts, tile_name=matched.name, validated=True))
 
     cap.release()
 
-    # Merge contiguous events for same tile
-    merged: List[SpeakerEvent] = []
     if not raw_events:
-        return merged
+        return []
 
+    # Merge by time and tile
+    raw_events.sort(key=lambda e: e.start)
+    merged: List[SpeakerEvent] = []
     cur = raw_events[0]
+    merge_tol = (1.5 / max(0.1, fps))
     for ev in raw_events[1:]:
-        if ev.tile_name == cur.tile_name and ev.start - cur.end <= (1.5 / fps):
+        if ev.tile_name == cur.tile_name and ev.start - cur.end <= merge_tol:
             cur.end = ev.end
         else:
             merged.append(cur)
             cur = ev
     merged.append(cur)
-    # Smooth small gaps by extending neighbors if close
+
+    # Smooth tiny gaps
     smoothed: List[SpeakerEvent] = []
     prev: Optional[SpeakerEvent] = None
+    gap_tol = (1.0 / max(0.1, fps))
     for ev in merged:
-        if prev and ev.start - prev.end < (1.0 / fps):
+        if prev and ev.start - prev.end < gap_tol:
             prev.end = ev.end
         else:
             if prev:
@@ -517,9 +505,11 @@ def build_active_speaker_timeline(video_path: Path, tiles: List[Tile], fps: floa
         smoothed.append(prev)
     return smoothed
 
+def _detect_one_frame(ts: float, frame: "np.ndarray"):
+    boxes = detect_blue_border_regions(frame)
+    return ts, boxes
 
 # ----------------------------- Alignment & Normalization -----------------------------
-
 VOCAB_RULES = [
     (r"\bF[-\s]?out\b", "ephOut"),
     (r"\bFL\b", "ephOut"),
@@ -534,23 +524,25 @@ def apply_vocab_rules(text: str) -> str:
         out = re.sub(pat, repl, out, flags=re.IGNORECASE)
     return out
 
-
 def map_tile_to_attendee_name(tile_name: str, attendees: Dict[str, str]) -> str:
     """Fuzzy map OCR'd tile name to a known attendee name from .ics."""
     if not attendees:
         return tile_name
     choices = list(attendees.keys())
-    # RapidFuzz ratio mapping; fallback to raw tile if low score
     best = rf_process.extractOne(tile_name, choices, scorer=fuzz.WRatio)
     if best and best[1] >= 80:
         return best[0]
     return tile_name
 
+def overlap(a: Tuple[float, float], b: Tuple[float, float]) -> float:
+    s1, e1 = a
+    s2, e2 = b
+    s = max(s1, s2)
+    e = min(e1, e2)
+    return max(0.0, e - s)
 
 def attribute_segments(segments: List[Dict], timeline: List[SpeakerEvent], attendees: Dict[str, str]) -> List[TranscriptSegment]:
-    """
-    Assign speaker to each STT segment by overlapping time with active-speaker windows.
-    """
+    """Assign speaker to each STT segment by overlapping with active-speaker windows."""
     if not segments:
         return []
     events = sorted(timeline, key=lambda e: e.start)
@@ -559,7 +551,6 @@ def attribute_segments(segments: List[Dict], timeline: List[SpeakerEvent], atten
     for seg in segments:
         s_start, s_end, s_text = float(seg["start"]), float(seg["end"]), apply_vocab_rules(seg["text"])
         s_prob = seg.get("prob", None)
-        # Find overlapping event
         chosen = None
         while i < len(events) and events[i].end < s_start:
             i += 1
@@ -572,7 +563,6 @@ def attribute_segments(segments: List[Dict], timeline: List[SpeakerEvent], atten
                 chosen = events[j]
             j += 1
         if chosen:
-            # Map OCR tile name to canonical attendee name (if matched)
             mapped = map_tile_to_attendee_name(chosen.tile_name, attendees)
             out.append(TranscriptSegment(
                 start=s_start, end=s_end, text=s_text, speaker=mapped, validated=chosen.validated, prob=s_prob
@@ -583,17 +573,7 @@ def attribute_segments(segments: List[Dict], timeline: List[SpeakerEvent], atten
             ))
     return out
 
-
-def overlap(a: Tuple[float, float], b: Tuple[float, float]) -> float:
-    s1, e1 = a
-    s2, e2 = b
-    s = max(s1, s2)
-    e = min(e1, e2)
-    return max(0.0, e - s)
-
-
 # ----------------------------- Outputs -----------------------------
-
 def write_vtt(segments: List[TranscriptSegment], out_path: Path, attendees: Dict[str, str]) -> None:
     out_lines = ["WEBVTT", ""]
     for i, seg in enumerate(segments, 1):
@@ -610,11 +590,9 @@ def write_vtt(segments: List[TranscriptSegment], out_path: Path, attendees: Dict
         out_lines.append("")
     out_path.write_text("\n".join(out_lines), encoding="utf-8")
 
-
 def write_segments_json(segments: List[TranscriptSegment], out_path: Path) -> None:
     data = [dataclasses.asdict(s) for s in segments]
     out_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-
 
 def write_qa_report(segments: List[TranscriptSegment], timeline: List[SpeakerEvent], out_path: Path) -> None:
     total = len(segments)
@@ -630,10 +608,7 @@ def write_qa_report(segments: List[TranscriptSegment], timeline: List[SpeakerEve
     }
     out_path.write_text(json.dumps(coverage, indent=2), encoding="utf-8")
 
-
-
 # ----------------------------- Interactive Prompts -----------------------------
-
 def _try_tk():
     try:
         import tkinter as _tk  # type: ignore
@@ -643,7 +618,7 @@ def _try_tk():
         return None, None
 
 def _prompt_path_console(label: str, is_dir: bool = False) -> Path:
-    print(f"[INPUT] {label} (you can drag the file/folder into this window and press Enter)")
+    print(f"[INPUT] {label} (drag the file/folder here then press Enter)")
     while True:
         raw = input("> ").strip().strip('"').strip("'")
         if not raw:
@@ -677,30 +652,22 @@ def _prompt_path_gui(label: str, is_dir: bool = False, filetypes=None) -> Option
     return None
 
 def prompt_paths_interactive(args) -> Tuple[Path, Path, Path, Path]:
-    """
-    Prompt user to select video, screenshot, ics, and output directory.
-    Supports GUI via Tkinter if available; else console prompt that accepts drag-and-drop.
-    """
     video = args.video if isinstance(args.video, Path) else None
     screenshot = args.screenshot if isinstance(args.screenshot, Path) else None
     ics = args.ics if isinstance(args.ics, Path) else None
     outdir = args.outdir if isinstance(args.outdir, Path) else None
 
-    # Video
     if not video:
         video = _prompt_path_gui("Select meeting video (mp4/mkv/etc.)",
                                  filetypes=[("Video", "*.mp4 *.mkv *.mov *.avi"), ("All", "*.*")]) \
                 or _prompt_path_console("Drop meeting video path")
-    # Screenshot
     if not screenshot:
         screenshot = _prompt_path_gui("Select meeting grid screenshot (PNG/JPG)",
                                       filetypes=[("Images", "*.png *.jpg *.jpeg"), ("All", "*.*")]) \
                     or _prompt_path_console("Drop screenshot path")
-    # ICS
     if not ics:
         ics = _prompt_path_gui("Select meeting .ics file", filetypes=[("ICS", "*.ics"), ("All", "*.*")]) \
               or _prompt_path_console("Drop .ics path")
-    # Outdir
     if not outdir:
         outdir = _prompt_path_gui("Select output directory", is_dir=True) \
                  or _prompt_path_console("Drop output directory", is_dir=True)
@@ -708,33 +675,42 @@ def prompt_paths_interactive(args) -> Tuple[Path, Path, Path, Path]:
     return video, screenshot, ics, outdir
 
 # ----------------------------- Orchestrator -----------------------------
-
-def process_meeting(video: Path, screenshot: Path, ics: Path, outdir: Path, stt_prefers_faster: bool, stt_model: str, fps: float) -> Dict[str, str]:
+def process_meeting(video: Path, screenshot: Path, ics: Path, outdir: Path,
+                    stt_prefers_faster: bool, stt_model: str, fps: float,
+                    device: str, compute_type: str, cpu_threads: int, whisper_workers: int,
+                    language: Optional[str], tesseract_cmd: Optional[str],
+                    video_workers: int) -> Dict[str, str]:
     ensure_deps()
     outdir.mkdir(parents=True, exist_ok=True)
 
-    # 1) ICS
+    # CUDA sanity print (best-effort)
+    try:
+        import torch  # type: ignore
+        print(f"[CUDA] torch.cuda.is_available() = {torch.cuda.is_available()}")
+    except Exception:
+        pass
+
     attendees = parse_ics_attendees(ics)
 
-    # 2) Screenshot -> tiles
-    name_bboxes = ocr_names_from_screenshot(screenshot)
+    name_bboxes = ocr_names_from_screenshot(screenshot, tesseract_cmd=tesseract_cmd)
     tiles = build_grid_from_names(name_bboxes)
     if not tiles:
         raise RuntimeError("No participant tiles recognized from screenshot OCR. Check image quality or OCR install.")
 
-    # 3) Video -> active speaker timeline
-    timeline = build_active_speaker_timeline(video, tiles, fps=fps)
+    timeline = build_active_speaker_timeline(video, tiles, fps=fps, video_workers=video_workers)
 
-    # 4) Audio -> STT
     wav_path = outdir / "audio_16k.wav"
     run_ffmpeg_extract_audio(video, wav_path)
-    engine = stt_factory(prefer_faster=stt_prefers_faster, model_size=stt_model)
-    stt_segments = engine.transcribe(wav_path)
+    engine = stt_factory(prefer_faster=stt_prefers_faster, model_size=stt_model,
+                         device=device, compute_type=compute_type,
+                         cpu_threads=cpu_threads, num_workers=whisper_workers)
+    print(f"[STT] engine={'faster-whisper' if isinstance(engine, FasterWhisperEngine) else 'openai-whisper'} "
+          f"device={device} compute_type={compute_type} cpu_threads={cpu_threads} workers={whisper_workers} "
+          f"lang={language or 'auto'}")
+    stt_segments = engine.transcribe(wav_path, language=language)
 
-    # 5) Align & attribute
     segments = attribute_segments(stt_segments, timeline, attendees)
 
-    # 6) Outputs
     vtt_path = outdir / "speaker_attributed.vtt"
     json_path = outdir / "transcript_segments.json"
     qa_path = outdir / "qa_report.json"
@@ -742,28 +718,36 @@ def process_meeting(video: Path, screenshot: Path, ics: Path, outdir: Path, stt_
     write_segments_json(segments, json_path)
     write_qa_report(segments, timeline, qa_path)
 
-    return {
-        "vtt": str(vtt_path),
-        "segments_json": str(json_path),
-        "qa_report": str(qa_path),
-    }
-
+    return {"vtt": str(vtt_path), "segments_json": str(json_path), "qa_report": str(qa_path)}
 
 def main():
-    p = argparse.ArgumentParser(description="Offline Teams meeting speaker attribution & transcription")
+    p = argparse.ArgumentParser(description="Offline Teams meeting speaker attribution & transcription (V2-multithread)")
+    # New flags
     p.add_argument("--interactive", action="store_true", help="Prompt for paths (GUI if available; console otherwise)")
+    p.add_argument("--fps", type=float, default=2.0, help="Frame samples per second for border detection (default 2)")
+    p.add_argument("--stt-model", type=str, default="medium", help="STT model size (small/base/medium/large)")
+    p.add_argument("--prefer-faster", action="store_true", help="Prefer faster-whisper if available")
+    p.add_argument("--device", default="auto", choices=["auto","cuda","cpu"], help="STT device")
+    p.add_argument("--compute-type", default="float16", help="faster-whisper compute type (float16,int8,int8_float16, etc.)")
+    p.add_argument("--cpu-threads", type=int, default=0, help="CPU threads for decoding (0=lib default)")
+    p.add_argument("--whisper-workers", type=int, default=1, help="Parallel workers inside faster-whisper")
+    p.add_argument("--lang", default="en", help="Force STT language (default: en). Use 'auto' to let the model detect.")
+    p.add_argument("--video-workers", type=int, default=4, help="Threads for border detection compute")
+    p.add_argument("--tesseract-cmd", type=str, default=None, help="Full path to tesseract.exe if not in PATH")
+
+    # Optional positional args for paths (interactive will prompt if missing)
     p.add_argument("--video", type=Path, help="Path to meeting video (mp4/mkv/etc.)")
     p.add_argument("--screenshot", type=Path, help="High-res grid screenshot with names visible")
     p.add_argument("--ics", type=Path, help="Meeting .ics file with attendees")
     p.add_argument("--outdir", type=Path, help="Output directory")
-    p.add_argument("--fps", type=float, default=2.0, help="Frame samples per second for border detection (default 2)")
-    p.add_argument("--stt-model", type=str, default="medium", help="STT model size (small/base/medium/large)")
-    p.add_argument("--prefer-faster", action="store_true", help="Prefer faster-whisper if available")
+
     args = p.parse_args()
 
-    # If interactive or any required path is missing, prompt one-by-one
+    # Interactive prompting if requested or any path is missing
     if args.interactive or not all([args.video, args.screenshot, args.ics, args.outdir]):
         args.video, args.screenshot, args.ics, args.outdir = prompt_paths_interactive(args)
+
+    language = None if (args.lang or "").lower() == "auto" else args.lang
 
     try:
         outputs = process_meeting(
@@ -774,12 +758,18 @@ def main():
             stt_prefers_faster=args.prefer_faster,
             stt_model=args.stt_model,
             fps=args.fps,
+            device=args.device,
+            compute_type=args.compute_type,
+            cpu_threads=args.cpu_threads,
+            whisper_workers=args.whisper_workers,
+            language=language,
+            tesseract_cmd=args.tesseract_cmd,
+            video_workers=args.video_workers,
         )
         print(json.dumps({"status": "ok", "outputs": outputs}, indent=2))
     except Exception as e:
         print(json.dumps({"status": "error", "error": str(e)}))
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()
