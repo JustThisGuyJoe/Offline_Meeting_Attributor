@@ -193,298 +193,462 @@ class TranscriptSegment:
 
 # ----------------------------- Utilities -----------------------------
 def run_ffmpeg_extract_audio(video: Path, out_wav: Path, sample_rate: int = 16000) -> None:
-    """Extract mono WAV via ffmpeg for STT."""
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", str(video),
-        "-ac", "1",
-        "-ar", str(sample_rate),
-        str(out_wav),
-    ]
+    cmd = ["ffmpeg","-y","-i",str(video),"-ac","1","-ar",str(sample_rate),str(out_wav)]
     proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if proc.returncode != 0:
         raise RuntimeError(f"ffmpeg failed: {proc.stderr.decode('utf-8', errors='ignore')}")
 
 def hhmmss(seconds: float) -> str:
-    td = timedelta(seconds=float(max(0.0, seconds)))
-    total_seconds = int(td.total_seconds())
-    ms = int((seconds - int(seconds)) * 1000)
-    h = total_seconds // 3600
-    m = (total_seconds % 3600) // 60
-    s = total_seconds % 60
+    total = int(max(0, seconds))
+    ms = int((max(0.0, seconds) - int(max(0, seconds))) * 1000)
+    h = total // 3600; m = (total % 3600) // 60; s = total % 60
     return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
 
-def ensure_deps():
-    missing = []
-    if cv2 is None:
-        missing.append("opencv-python")
-    if np is None:
-        missing.append("numpy")
-    if Image is None:
-        missing.append("Pillow")
-    if pytesseract is None:
-        missing.append("pytesseract (+ Tesseract binary)")
-    if Calendar is None:
-        missing.append("icalendar")
-    if fuzz is None or rf_process is None:
-        missing.append("rapidfuzz")
-    if missing:
-        raise RuntimeError(f"Missing dependencies: {', '.join(missing)}")
-
-# ----------------------------- ICS Parsing -----------------------------
-def parse_ics_attendees(ics_path: Path) -> Dict[str, str]:
-    """
-    Parse attendee names from .ics. Returns dict mapping display-name -> company (best guess).
-
-    Company inference heuristic:
-      - If ORG or X-ORGANIZATION present, use it.
-      - Else derive from email domain (e.g., jane@omitron.com -> Omitron).
-    """
-    attendees: Dict[str, str] = {}
+# ----------------------------- ICS Parsing (extended) -----------------------------
+def parse_ics_attendees_extended(ics_path: Path) -> Tuple[Dict[str,str], Dict[str,str], Dict[str,List[str]]]:
     text = ics_path.read_bytes()
     cal = Calendar.from_ical(text)
 
     def domain_to_company(email: str) -> str:
         dom = email.split("@")[-1].split(">")[0].strip().lower()
-        if "." in dom:
-            base = dom.split(".")[0]
-        else:
-            base = dom
-        mapping = {"omitron": "Omitron"}  # normalize
+        base = dom.split(".")[0] if "." in dom else dom
+        mapping = {"omitron": "Omitron"}
         return mapping.get(base, base.capitalize())
 
+    name_to_company: Dict[str,str] = {}
+    email_to_name: Dict[str,str] = {}
+    all_names: List[str] = []
+
+    def record(name: Optional[str], email: Optional[str]):
+        if not name and not email: return
+        nm = name.strip() if name else None
+        em = email.strip().lower() if email else None
+        comp = domain_to_company(em) if em else ""
+        if nm:
+            name_to_company[nm] = name_to_company.get(nm, comp) or comp
+            if nm not in all_names: all_names.append(nm)
+        if em and nm:
+            email_to_name[em] = nm
+
     for comp in cal.walk():
-        if comp.name == "VEVENT":
-            # Organizer (optional)
-            org = comp.get("ORGANIZER") or comp.get("organizer")
-            if org:
-                val = str(org)
-                m = re.search(r"CN=([^:;]+)", val)
+        if comp.name != "VEVENT": continue
+        org = comp.get("ORGANIZER") or comp.get("organizer")
+        if org:
+            sval = str(org)
+            mcn = re.search(r"CN=([^:;]+)", sval); men = re.search(r"mailto:([^>\s]+)", sval, re.I)
+            record(mcn.group(1) if mcn else None, men.group(1) if men else None)
+
+        raw_atts = comp.get("attendee") or comp.get("ATTENDEE") or []
+        if not isinstance(raw_atts, list): raw_atts = [raw_atts]
+        for att in raw_atts:
+            try:
+                params = getattr(att, "params", {})
+            except Exception:
+                params = {}
+            cn = None
+            if params and "CN" in params: cn = str(params["CN"]).strip()
+            sval = str(att)
+            if not cn:
+                m = re.search(r"CN=([^:;]+)", sval)
                 cn = m.group(1).strip() if m else None
-                email_m = re.search(r"mailto:([^>\s]+)", val, re.I)
-                company = domain_to_company(email_m.group(1)) if email_m else ""
-                if cn:
-                    attendees[cn] = company or attendees.get(cn, "")
+            men = re.search(r"mailto:([^>\s]+)", sval, re.I)
+            record(cn, men.group(1) if men else None)
 
-            # Attendees can be list or single value; no .getall
-            raw_atts = comp.get("attendee") or comp.get("ATTENDEE") or []
-            if not isinstance(raw_atts, list):
-                raw_atts = [raw_atts]
+    # initials map
+    from collections import defaultdict
+    initials_map: Dict[str, List[str]] = defaultdict(list)
+    for nm in all_names:
+        parts = [p for p in re.split(r"[\s,]+", nm) if p]
+        if len(parts)>=2:
+            init = (parts[0][0] + parts[-1][0]).upper()
+        else:
+            init = parts[0][0].upper() if parts else ""
+        if init: initials_map[init].append(nm)
 
-            for att in raw_atts:
-                cn = None
-                try:
-                    params = getattr(att, "params", {})
-                    if params and "CN" in params:
-                        cn = str(params["CN"]).strip()
-                except Exception:
-                    pass
-                sval = str(att)
-                if not cn:
-                    m = re.search(r"CN=([^:;]+)", sval)
-                    cn = m.group(1).strip() if m else None
-                email_m = re.search(r"mailto:([^>\s]+)", sval, re.I)
-                company = domain_to_company(email_m.group(1)) if email_m else ""
-                if cn:
-                    attendees[cn] = company or attendees.get(cn, "")
+    return name_to_company, email_to_name, dict(initials_map)
 
-    # Enforce Omitron spelling
-    norm = {}
-    for name, compy in attendees.items():
-        compy = "Omitron" if compy.lower() == "omitron" else compy
-        norm[name] = compy
-    return norm
+# ----------------------------- OCR helpers -----------------------------
+def set_tesseract_cmd_if_provided():
+    if CONFIG["TESSERACT_CMD"]:
+        pytesseract.pytesseract.tesseract_cmd = CONFIG["TESSERACT_CMD"]
 
-# ----------------------------- OCR & Grid -----------------------------
-def set_tesseract_cmd_if_provided(tesseract_cmd: Optional[str]):
-    if pytesseract is None:
-        raise RuntimeError("pytesseract is not installed. pip install pytesseract")
-    if tesseract_cmd:
-        pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
+def _clean_text(txt: str) -> str:
+    txt = re.sub(r"[\r\n]+", " ", txt).strip()
+    txt = re.sub(CONFIG["OCR_ALLOWED_RE"], "", txt)  # strip disallowed chars
+    txt = re.sub(r"\s{2,}", " ", txt)
+    return txt.strip()
 
-def ocr_names_from_screenshot(screenshot_path: Path, tesseract_cmd: Optional[str] = None) -> List[Tuple[str, Tuple[int, int, int, int]]]:
-    """
-    Return list of (name, bbox) for tiles detected in the meeting screenshot.
-    Heuristic:
-      - Convert to grayscale, adaptive threshold to highlight text regions.
-      - Use OpenCV contour detection to find name ribbons near tile bottoms.
-      - Apply Tesseract OCR on these regions.
-    """
-    set_tesseract_cmd_if_provided(tesseract_cmd)
+def _preproc_gray(img_bgr):
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    gray = cv2.bilateralFilter(gray, d=5, sigmaColor=75, sigmaSpace=75)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    gray = clahe.apply(gray)
+    return gray
 
+def _tess_data(img, psm: int) -> List[Dict[str, Any]]:
+    custom = f'--oem 3 --psm {psm} -l {CONFIG["OCR_LANG"]}'
+    d = pytesseract.image_to_data(img, config=custom, output_type=pytesseract.Output.DICT)
+    out = []
+    n = len(d.get("text", []))
+    for i in range(n):
+        txt = d["text"][i]
+        if not txt: continue
+        try: conf = float(d.get("conf", ["-1"])[i])
+        except: conf = -1.0
+        x = int(d["left"][i]); y = int(d["top"][i]); w = int(d["width"][i]); h = int(d["height"][i])
+        out.append({"text": _clean_text(txt), "conf": conf, "bbox": (x,y,w,h)})
+    return out
+
+def _auto_top_offset(gray: np.ndarray) -> int:
+    if not CONFIG["AUTO_TOP_OFFSET"]: return int(CONFIG["TOP_OFFSET_FRAC"] * gray.shape[0])
+    H, W = gray.shape[:2]
+    # gradient magnitude per row
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    mag = cv2.magnitude(gx, gy)
+    row_energy = mag.mean(axis=1)
+    search_to = int(0.2 * H)
+    if search_to < 10: return int(CONFIG["TOP_OFFSET_FRAC"] * H)
+    idx = np.argmax(row_energy[:search_to])
+    off = int(min(max(idx + 10, H*0.06), H*0.15))
+    return off
+
+def _cell_bbox_from_point(cx, cy, W, H, top_off):
+    grid_h = max(1, H - top_off)
+    tile_w = W / 3.0
+    tile_h = grid_h / 3.0
+    col = int(max(0, min(2, cx // tile_w)))
+    row = int(max(0, min(2, (cy - top_off) // tile_h)))
+    bx = int(col * tile_w); by = int(top_off + row * tile_h)
+    bw = int(tile_w); bh = int(tile_h)
+    inset = CONFIG["GRID_INSET"]
+    return (bx+inset, by+inset, max(1,bw-2*inset), max(1,bh-2*inset)), (row, col)
+
+def _tile_bbox_from_bbox(bb, W, H, top_off):
+    x,y,w,h = bb
+    cx = x + w/2; cy = y + h/2
+    return _cell_bbox_from_point(cx, cy, W, H, top_off)
+
+def _union_bbox(b1, b2):
+    x1,y1,w1,h1 = b1; x2,y2,w2,h2 = b2
+    xa = min(x1,x2); ya = min(y1,y2)
+    xb = max(x1+w1, x2+w2); yb = max(y1+h1, y2+h2)
+    return (xa, ya, xb-xa, yb-ya)
+
+def _strip_badges(t: str) -> str:
+    t = re.sub(r"\[[^\]]+\]", " ", t)
+    t = re.sub(r"\([^\)]+\)", " ", t)
+    return re.sub(r"\s{2,}", " ", t).strip()
+
+def ocr_to_tiles(screenshot_path: Path, attendees_name_to_company: Dict[str,str],
+                 email_to_name: Dict[str,str], initials_map: Dict[str,List[str]], outdir: Path):
+    set_tesseract_cmd_if_provided()
     img = cv2.imread(str(screenshot_path))
-    if img is None:
-        raise RuntimeError(f"Failed to read screenshot: {screenshot_path}")
-    h, w = img.shape[:2]
+    if img is None: raise RuntimeError(f"Failed to read screenshot: {screenshot_path}")
+    H, W = img.shape[:2]
+    gray = _preproc_gray(img)
+    top_off = _auto_top_offset(gray)
+    print(f"[GRID] top_offset={top_off} (auto={'on' if CONFIG['AUTO_TOP_OFFSET'] else 'off'})")
 
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (3, 3), 0)
-    thr = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
-                                cv2.THRESH_BINARY_INV, 21, 10)
+    # Pass A: full image PSM6
+    wordsA = _tess_data(gray, psm=6)
+    # Pass B: bottom strips per cell PSM7
+    strips = []
+    grid_h = H - top_off
+    tile_h = int(grid_h / 3.0)
+    tile_w = int(W / 3.0)
+    for r in range(3):
+        y1 = top_off + r*tile_h + int(tile_h*0.72)
+        y2 = top_off + (r+1)*tile_h - int(tile_h*0.05)
+        y1 = max(top_off, min(H-1, y1)); y2 = max(y1+5, min(H, y2))
+        strips.append((y1, y2))
+    wordsB = []
+    for r in range(3):
+        for c in range(3):
+            x1 = c*tile_w; x2 = (c+1)*tile_w
+            y1,y2 = strips[r]
+            roi = gray[y1:y2, x1:x2]
+            if roi.size == 0: continue
+            data = _tess_data(roi, psm=7)
+            for w in data:
+                x,y,wid,hei = w["bbox"]
+                w["bbox"] = (x1+x, y1+y, wid, hei)
+            wordsB.extend(data)
 
-    contours, _ = cv2.findContours(thr, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    candidates = []
-    for c in contours:
-        x, y, cw, ch = cv2.boundingRect(c)
-        aspect = cw / max(1, ch)
-        area = cw * ch
-        if area < 500 or aspect < 2.5:
-            continue
-        if y < h * 0.3:
-            continue
-        candidates.append((x, y, cw, ch))
+    # Merge + filter
+    words_all = wordsA + wordsB
+    words_keep = [w for w in words_all if w["conf"] >= CONFIG["OCR_WORD_CONF_MIN"] and _clean_text(w["text"])]
+    # Debug overlay
+    dbg = img.copy()
+    for w in words_keep:
+        x,y,ww,hh = w["bbox"]
+        cv2.rectangle(dbg, (x,y), (x+ww,y+hh), (0,255,255), 1)
+    cv2.imwrite(str(outdir / "ocr_tokens_v2.png"), dbg)
+    print(f"[OCRDBG] Tokens (merged) conf>={CONFIG['OCR_WORD_CONF_MIN']}: {len(words_keep)}")
 
-    merged = []
-    for x, y, cw, ch in sorted(candidates, key=lambda b: b[0]):
-        if not merged:
-            merged.append([x, y, x + cw, y + ch])
+    name_to_company = attendees_name_to_company
+    attendee_names = list(name_to_company.keys())
+
+    kept_tiles: Dict[str, Tuple[int,int,int,int]] = {}
+    kept_score: Dict[str, float] = {}
+
+    # Initials-first (global) + large-bubble heuristic
+    init_hits = 0; init_seen = 0
+    for w in words_keep:
+        t = _clean_text(w["text"]).upper()
+        if re.fullmatch(r"[A-Z]{2}", t):
+            init_seen += 1
+            # cell bbox to estimate area
+            tile_bb, _ = _tile_bbox_from_bbox(w["bbox"], W, H, top_off)
+            cell_area = tile_bb[2] * tile_bb[3]
+            token_area = w["bbox"][2] * w["bbox"][3]
+            large_bubble = token_area >= CONFIG["LARGE_BUBBLE_AREA_FRAC"] * cell_area
+            conf_ok = (w["conf"] >= CONFIG["INITIALS_CONF_MIN"])
+            if conf_ok or large_bubble:
+                names = initials_map.get(t, [])
+                if len(names) == 1:
+                    name = names[0]
+                    score = max(w["conf"], 80.0 if large_bubble else w["conf"])
+                    if score > kept_score.get(name, -1):
+                        kept_tiles[name] = tile_bb; kept_score[name] = score
+                        init_hits += 1
+    print(f"[OCRDBG] Initials tokens seen={init_seen} mapped_unique={init_hits}")
+
+    # Phrase assembly per cell bottom (1..5)
+    def token_in_bottom_strip(w):
+        x,y,ww,hh = w["bbox"]
+        cy = y + hh/2
+        return cy >= top_off + tile_h*0.70
+
+    cell_words = [w for w in words_keep if token_in_bottom_strip(w)]
+    cell_words.sort(key=lambda z: (z["bbox"][1], z["bbox"][0]))
+
+    lines: List[List[Dict[str,Any]]] = []
+    for w in cell_words:
+        if not lines: lines.append([w]); continue
+        last_y = sum([ww["bbox"][1] for ww in lines[-1]])/len(lines[-1])
+        if abs(w["bbox"][1]-last_y) <= 22:
+            lines[-1].append(w)
         else:
-            mx1, my1, mx2, my2 = merged[-1]
-            if x <= mx2 + 10 and y <= my2 + 10 and (x + cw) >= mx1 - 10:
-                merged[-1] = [min(mx1, x), min(my1, y), max(mx2, x + cw), max(my2, y + ch)]
-            else:
-                merged.append([x, y, x + cw, y + ch])
+            lines.append([w])
 
-    results = []
-    for mx1, my1, mx2, my2 in merged:
-        roi = img[my1:my2, mx1:mx2]
-        if roi.size == 0:
-            continue
-        config = "--psm 7"
-        text = pytesseract.image_to_string(roi, config=config)
-        text = re.sub(r"[\r\n]+", " ", text).strip()
-        if not text:
-            continue
-        results.append((text, (mx1, my1, mx2 - mx1, my2 - my1)))
-    return results
+    def union_bbox_chain(toks):
+        bb = toks[0]["bbox"]
+        for t in toks[1:]:
+            bb = _union_bbox(bb, t["bbox"])
+        return bb
 
-def build_grid_from_names(name_bboxes: List[Tuple[str, Tuple[int, int, int, int]]]) -> List[Tile]:
-    """Assign grid positions to tiles by sorting by y then x; name normalization applied."""
-    if not name_bboxes:
-        return []
-    name_bboxes_sorted = sorted(name_bboxes, key=lambda x: (x[1][1], x[1][0]))
-    rows: List[List[Tuple[str, Tuple[int, int, int, int]]]] = []
-    row_threshold = 50
-    for name, bbox in name_bboxes_sorted:
-        x, y, w, h = bbox
-        if not rows:
-            rows.append([(name, bbox)])
-            continue
-        last_row_y = np.mean([b[1][1] for b in rows[-1]])
-        if abs(y - last_row_y) <= row_threshold:
-            rows[-1].append((name, bbox))
-        else:
-            rows.append([(name, bbox)])
-    tiles: List[Tile] = []
-    for r_idx, row in enumerate(rows):
-        row_sorted = sorted(row, key=lambda x: x[1][0])
-        for c_idx, (name, bbox) in enumerate(row_sorted):
-            clean = " ".join(name.split())
-            tiles.append(Tile(name=clean, bbox=bbox, grid_pos=(r_idx, c_idx)))
-    return tiles
+    phrase_attempts = 0; phrase_hits = 0
+    for line in lines:
+        line.sort(key=lambda z: z["bbox"][0])
+        n = len(line)
+        for i in range(n):
+            for L in (1,2,3,4,5):
+                if i+L>n: break
+                toks = line[i:i+L]
+                phrase_attempts += 1
+                text = " ".join([_clean_text(tt["text"]) for tt in toks])
+                if not text: continue
+                text = _strip_badges(text)
+                bb = union_bbox_chain(toks)
+
+                # Email → name
+                email_match = re.search(r"[A-Za-z0-9._%+-]+@([A-Za-z0-9.-]+)", text)
+                if email_match:
+                    email = email_match.group(0).lower()
+                    name = email_to_name.get(email)
+                    if not name and attendee_names:
+                        local = email.split("@")[0]
+                        best = rf_process.extractOne(local, attendee_names, scorer=fuzz.WRatio)
+                        if best and best[1] >= CONFIG["FUZZ_MIN_SCORE"]:
+                            name = best[0]
+                    if name:
+                        tile_bb, _ = _tile_bbox_from_bbox(bb, W, H, top_off)
+                        score = 85.0
+                        if score > kept_score.get(name, -1):
+                            kept_tiles[name] = tile_bb; kept_score[name] = score
+                            phrase_hits += 1
+                        continue
+
+                # Fuzzy full-name
+                if attendee_names:
+                    best = rf_process.extractOne(text, attendee_names, scorer=fuzz.WRatio)
+                    if best and best[1] >= CONFIG["FUZZ_MIN_SCORE"]:
+                        name = best[0]; score = best[1]
+                        tile_bb, _ = _tile_bbox_from_bbox(bb, W, H, top_off)
+                        if score > kept_score.get(name, -1):
+                            kept_tiles[name] = tile_bb; kept_score[name] = score
+                            phrase_hits += 1
+
+    print(f"[OCRDBG] Phrase attempts={phrase_attempts} accepted={phrase_hits}")
+
+    kept = [(name, kept_tiles[name]) for name in kept_tiles.keys()]
+    # overlay
+    overlay = img.copy()
+    for name, bb in kept:
+        x,y,w,h = bb
+        cv2.rectangle(overlay, (x,y), (x+w,y+h), (0,255,0), 2)
+        cv2.putText(overlay, name[:20], (x+8,y+24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 1, cv2.LINE_AA)
+    out_tiles = outdir / "tiles_from_tokens_v2.png"
+    cv2.imwrite(str(out_tiles), overlay)
+    print(f"[OCRDBG] Kept attendees as tiles: {len(kept)} -> {out_tiles}")
+
+    return kept, (W,H), top_off
 
 # ----------------------------- Blue Border Detection -----------------------------
-def detect_blue_border_regions(frame: "np.ndarray") -> List[Tuple[int, int, int, int]]:
-    """
-    Detect blue-ish rectangular borders in a frame. Returns bounding boxes.
-    """
+def detect_blue_border_regions(frame: "np.ndarray") -> Tuple[List[Tuple[int,int,int,int]], "np.ndarray"]:
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    lower1 = np.array([90, 50, 50])
-    upper1 = np.array([130, 255, 255])
-    mask1 = cv2.inRange(hsv, lower1, upper1)
+    lower = np.array(CONFIG["LOWER_HSV"], dtype=np.uint8)
+    upper = np.array(CONFIG["UPPER_HSV"], dtype=np.uint8)
+    mask = cv2.inRange(hsv, lower, upper)
     kernel = np.ones((3, 3), np.uint8)
-    mask = cv2.morphologyEx(mask1, cv2.MORPH_CLOSE, kernel, iterations=2)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
     boxes = []
     for cnt in contours:
         x, y, w, h = cv2.boundingRect(cnt)
         area = cv2.contourArea(cnt)
-        if w < 40 or h < 40:
-            continue
-        if area < 200:
-            continue
+        if w < CONFIG["MIN_BOX_W"] or h < CONFIG["MIN_BOX_H"]: continue
+        if area < CONFIG["MIN_AREA"]: continue
         stroke_ratio = area / max(1.0, w * h)
-        if stroke_ratio > 0.25:
-            continue
+        if stroke_ratio > CONFIG["MAX_STROKE_RATIO"]: continue
         boxes.append((x, y, w, h))
-    return boxes
+    return boxes, mask
 
-def match_boxes_to_tiles(boxes: List[Tuple[int, int, int, int]], tiles: List[Tile]) -> Optional[Tile]:
-    """Choose the tile whose bbox overlaps the blue border box the most (IoU)."""
-    if not boxes or not tiles:
-        return None
-
+def match_boxes_to_tiles(boxes, tiles: List[Tile]) -> Optional[Tile]:
+    if not boxes or not tiles: return None
     def iou(a, b):
-        ax, ay, aw, ah = a
-        bx, by, bw, bh = b
-        a2 = (ax + aw, ay + ah)
-        b2 = (bx + bw, by + bh)
-        x_left = max(ax, bx)
-        y_top = max(ay, by)
-        x_right = min(a2[0], b2[0])
-        y_bottom = min(a2[1], b2[1])
-        if x_right <= x_left or y_bottom <= y_top:
-            return 0.0
-        inter = (x_right - x_left) * (y_bottom - y_top)
-        union = aw * ah + bw * bh - inter
+        ax, ay, aw, ah = a; bx, by, bw, bh = b
+        a2 = (ax+aw, ay+ah); b2 = (bx+bw, by+bh)
+        x_left = max(ax, bx); y_top = max(ay, by)
+        x_right = min(a2[0], b2[0]); y_bottom = min(a2[1], b2[1])
+        if x_right <= x_left or y_bottom <= y_top: return 0.0
+        inter = (x_right-x_left)*(y_bottom-y_top)
+        union = aw*ah + bw*bh - inter
         return inter / max(1e-6, union)
-
-    best = None
-    best_iou = 0.0
+    best, best_iou = None, 0.0
     for b in boxes:
         for t in tiles:
             i = iou(b, t.bbox)
             if i > best_iou:
-                best_iou = i
-                best = t
+                best_iou, best = i, t
     return best if best_iou >= 0.05 else None
 
-def build_active_speaker_timeline(video_path: Path, tiles: List[Tile], fps: float = 2.0,
-                                  video_workers: int = 4) -> List[SpeakerEvent]:
-    """
-    Sample frames; detect blue border concurrently; map to tile; return merged intervals.
-    """
+def scale_tiles_to_frame(tiles: List[Tile], src_size: Tuple[int,int], dst_size: Tuple[int,int]) -> List[Tile]:
+    sw, sh = src_size; dw, dh = dst_size
+    if sw == 0 or sh == 0: return tiles
+    sx, sy = dw / sw, dh / sh
+    out = []
+    for t in tiles:
+        x, y, w, h = t.bbox
+        out.append(Tile(
+            name=t.name,
+            bbox=(int(round(x*sx)), int(round(y*sy)), int(round(w*sx)), int(round(h*sy))),
+            grid_pos=t.grid_pos
+        ))
+    return out
+
+# ----------------------------- Alignment & Normalization -----------------------------
+VOCAB_RULES = [
+    (r"\bF[-\s]?out\b", "ephOut"),
+    (r"\bFL\b", "ephOut"),
+    (r"\bsat[-\s]?no\b", "SATNO"),
+    (r"\bOmitron\b", "Omitron"),
+    (r"\b[Ee]phemerides\b", "ephemeris"),
+]
+def apply_vocab_rules(text: str) -> str:
+    out = text
+    for pat, repl in VOCAB_RULES: out = re.sub(pat, repl, out, flags=re.IGNORECASE)
+    return out
+
+def map_tile_to_attendee_name(tile_name: str, attendees: Dict[str, str]) -> str:
+    if not attendees: return tile_name
+    choices = list(attendees.keys())
+    if not choices: return tile_name
+    best = rf_process.extractOne(tile_name, choices, scorer=fuzz.WRatio)
+    if best and best[1] >= 70: return best[0]
+    return tile_name
+
+def overlap(a, b):
+    s1, e1 = a; s2, e2 = b
+    s = max(s1, s2); e = min(e1, e2)
+    return max(0.0, e - s)
+
+def attribute_segments(segments: List[Dict], timeline: List[SpeakerEvent], attendees: Dict[str, str]) -> List['TranscriptSegment']:
+    if not segments: return []
+    events = sorted(timeline, key=lambda e: e.start)
+    out: List[TranscriptSegment] = []
+    i = 0
+    for seg in segments:
+        s_start, s_end, s_text = float(seg["start"]), float(seg["end"]), apply_vocab_rules(seg["text"])
+        s_prob = seg.get("prob", None)
+        chosen = None
+        while i < len(events) and events[i].end < s_start: i += 1
+        j = i; best_overlap = 0.0
+        while j < len(events) and events[j].start <= s_end:
+            ov = overlap((s_start, s_end), (events[j].start, events[j].end))
+            if ov > best_overlap: best_overlap = ov; chosen = events[j]
+            j += 1
+        if chosen:
+            mapped = map_tile_to_attendee_name(chosen.tile_name, attendees)
+            out.append(TranscriptSegment(start=s_start, end=s_end, text=s_text, speaker=mapped, validated=chosen.validated, prob=s_prob))
+        else:
+            out.append(TranscriptSegment(start=s_start, end=s_end, text=s_text, speaker=None, validated=False, prob=s_prob))
+    return out
+
+# ----------------------------- Orchestrator -----------------------------
+def build_active_speaker_timeline(video_path: Path, tiles: List[Tile], fps: float,
+                                  video_workers: int, debug_dir: Optional[Path]) -> List[SpeakerEvent]:
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        raise RuntimeError(f"Failed to open video: {video_path}")
-
+    if not cap.isOpened(): raise RuntimeError(f"Failed to open video: {video_path}")
     native_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    step = int(max(1, round(native_fps / max(0.1, fps))))
 
-    # Read frames sequentially; dispatch detection
+    crop = CONFIG["VIDEO_CROP"]
+    def crop_frame(f):
+        if not crop: return f
+        x,y,w,h = crop
+        return f[y:y+h, x:x+w]
+
+    step = int(max(1, round(native_fps / max(0.1, fps))))
     idx = 0
     jobs = []
     with ThreadPoolExecutor(max_workers=max(1, video_workers)) as ex:
         while True:
             ret = cap.grab()
-            if not ret:
-                break
+            if not ret: break
             if idx % step == 0:
                 ret, frame = cap.retrieve()
-                if not ret or frame is None:
-                    break
+                if not ret or frame is None: break
                 ts = idx / native_fps
+                frame = crop_frame(frame)
                 jobs.append(ex.submit(_detect_one_frame, ts, frame))
             idx += 1
 
-        # Collect results
         raw_events: List[SpeakerEvent] = []
+        debug_counter = 0
         for fut in as_completed(jobs):
-            ts, boxes = fut.result()
+            ts, boxes, frame_dbg, mask_dbg = fut.result()
             matched = match_boxes_to_tiles(boxes, tiles)
             if matched is not None:
                 raw_events.append(SpeakerEvent(start=ts, end=ts, tile_name=matched.name, validated=True))
+            if CONFIG["DEBUG"] and debug_dir and frame_dbg is not None:
+                if debug_counter % CONFIG["DEBUG_EVERY_N"] == 0:
+                    canvas = frame_dbg.copy()
+                    for t in tiles:
+                        x,y,w,h = t.bbox; cv2.rectangle(canvas, (x,y), (x+w,y+h), (0,255,0), 2)
+                    for (x,y,w,h) in boxes:
+                        cv2.rectangle(canvas, (x,y), (x+w,y+h), (255,0,0), 2)
+                    cv2.imwrite(str(debug_dir / f"frame_{int(ts*1000):08d}.jpg"), canvas)
+                    if mask_dbg is not None:
+                        cv2.imwrite(str(debug_dir / f"mask_{int(ts*1000):08d}.png"), mask_dbg)
+                debug_counter += 1
 
     cap.release()
 
-    if not raw_events:
-        return []
+    if not raw_events: return []
 
-    # Merge by time and tile
     raw_events.sort(key=lambda e: e.start)
     merged: List[SpeakerEvent] = []
     cur = raw_events[0]
