@@ -720,31 +720,22 @@ def _prompt_path_console(label: str, is_dir: bool = False) -> Path:
     while True:
         raw = input("> ").strip().strip('"').strip("'")
         if not raw:
-            print("Please provide a path.")
-            continue
-        path = Path(raw).expanduser().resolve()
-        if is_dir and path.is_dir():
-            return path
-        if not is_dir and path.is_file():
-            return path
-        print(f"Path not valid as {'directory' if is_dir else 'file'}: {path}")
+            print("Please provide a path."); continue
+        pth = Path(raw).expanduser().resolve()
+        if is_dir and pth.is_dir(): return pth
+        if not is_dir and pth.is_file(): return pth
+        print("Not valid, try again.")
 
 def _prompt_path_gui(label: str, is_dir: bool = False, filetypes=None) -> Optional[Path]:
     _tk, _fd = _try_tk()
-    if not _tk:
-        return None
+    if not _tk: return None
     try:
-        root = _tk.Tk()
-        root.withdraw()
+        root = _tk.Tk(); root.withdraw()
         path_str = ""
-        if is_dir:
-            path_str = _fd.askdirectory(title=label) or ""
-        else:
-            path_str = _fd.askopenfilename(title=label, filetypes=filetypes or [("All files", "*.*")]) or ""
-        root.update_idletasks()
-        root.destroy()
-        if path_str:
-            return Path(path_str).expanduser().resolve()
+        if is_dir: path_str = _fd.askdirectory(title=label) or ""
+        else: path_str = _fd.askopenfilename(title=label, filetypes=filetypes or [("All files", "*.*")]) or ""
+        root.update_idletasks(); root.destroy()
+        if path_str: return Path(path_str).expanduser().resolve()
     except Exception:
         return None
     return None
@@ -772,102 +763,92 @@ def prompt_paths_interactive(args) -> Tuple[Path, Path, Path, Path]:
 
     return video, screenshot, ics, outdir
 
-# ----------------------------- Orchestrator -----------------------------
-def process_meeting(video: Path, screenshot: Path, ics: Path, outdir: Path,
-                    stt_prefers_faster: bool, stt_model: str, fps: float,
-                    device: str, compute_type: str, cpu_threads: int, whisper_workers: int,
-                    language: Optional[str], tesseract_cmd: Optional[str],
-                    video_workers: int) -> Dict[str, str]:
-    ensure_deps()
-    outdir.mkdir(parents=True, exist_ok=True)
+# ----------------------------- Main -----------------------------
+def main():
+    p = argparse.ArgumentParser(description="V2.8.1: relaxed thresholds + large-bubble initials")
+    p.add_argument("--interactive", action="store_true")
+    p.add_argument("--video", type=Path)
+    p.add_argument("--screenshot", type=Path)
+    p.add_argument("--ics", type=Path)
+    p.add_argument("--outdir", type=Path)
+    args = p.parse_args()
 
-    # CUDA sanity print (best-effort)
+    if args.interactive or not all([args.video, args.screenshot, args.ics, args.outdir]):
+        args.video, args.screenshot, args.ics, args.outdir = prompt_paths_interactive(args)
+
     try:
-        import torch  # type: ignore
+        import torch
         print(f"[CUDA] torch.cuda.is_available() = {torch.cuda.is_available()}")
     except Exception:
         pass
 
-    attendees = parse_ics_attendees(ics)
+    outdir: Path = args.outdir
+    outdir.mkdir(parents=True, exist_ok=True)
 
-    name_bboxes = ocr_names_from_screenshot(screenshot, tesseract_cmd=tesseract_cmd)
-    tiles = build_grid_from_names(name_bboxes)
-    if not tiles:
-        raise RuntimeError("No participant tiles recognized from screenshot OCR. Check image quality or OCR install.")
+    # Parse ICS (extended)
+    name_to_company, email_to_name, initials_map = parse_ics_attendees_extended(args.ics)
+    print(f"[ICS] Attendees parsed: {len(name_to_company)} names, {len(email_to_name)} emails")
 
-    timeline = build_active_speaker_timeline(video, tiles, fps=fps, video_workers=video_workers)
+    # OCR -> tiles
+    kept, shot_size, top_off = ocr_to_tiles(args.screenshot, name_to_company, email_to_name, initials_map, outdir=outdir)
+    print(f"[OCR] Tiles from tokens: {len(kept)} | screenshot size={shot_size}")
+    if kept[:9]:
+        print("     Sample:", [n for n,_ in kept[:9]])
 
+    tiles = [Tile(name=n, bbox=bb, grid_pos=(0,0)) for n,bb in kept]
+    tiles.sort(key=lambda t: (t.bbox[1], t.bbox[0]))
+    for i, t in enumerate(tiles):
+        tiles[i] = Tile(name=t.name, bbox=t.bbox, grid_pos=(i//3, i%3))
+    print(f"[GRID] Tiles built: {len(tiles)}")
+
+    # Video size
+    cap_sz = cv2.VideoCapture(str(args.video))
+    if not cap_sz.isOpened(): raise RuntimeError("Cannot open video to query size")
+    vw = int(cap_sz.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    vh = int(cap_sz.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    cap_sz.release()
+    dst_size = (vw, vh) if not CONFIG["VIDEO_CROP"] else (CONFIG["VIDEO_CROP"][2], CONFIG["VIDEO_CROP"][3])
+    print(f"[VIDEO] size={vw}x{vh} | target grid size={dst_size} | crop={CONFIG['VIDEO_CROP']}")
+    tiles_scaled = scale_tiles_to_frame(tiles, shot_size, dst_size)
+
+    # Audio -> STT
     wav_path = outdir / "audio_16k.wav"
-    run_ffmpeg_extract_audio(video, wav_path)
-    engine = stt_factory(prefer_faster=stt_prefers_faster, model_size=stt_model,
-                         device=device, compute_type=compute_type,
-                         cpu_threads=cpu_threads, num_workers=whisper_workers)
-    print(f"[STT] engine={'faster-whisper' if isinstance(engine, FasterWhisperEngine) else 'openai-whisper'} "
-          f"device={device} compute_type={compute_type} cpu_threads={cpu_threads} workers={whisper_workers} "
-          f"lang={language or 'auto'}")
-    stt_segments = engine.transcribe(wav_path, language=language)
+    run_ffmpeg_extract_audio(args.video, wav_path)
+    stt_segments, used = safe_transcribe(wav_path, language=CONFIG["LANGUAGE"])
+    print(f"[STT] Using: {used} | Segments: {len(stt_segments)}")
 
-    segments = attribute_segments(stt_segments, timeline, attendees)
+    # Timeline & debug
+    debug_dir = outdir / "debug" if CONFIG["DEBUG"] else None
+    if debug_dir: debug_dir.mkdir(parents=True, exist_ok=True)
+    timeline = build_active_speaker_timeline(
+        video_path=args.video,
+        tiles=tiles_scaled,
+        fps=CONFIG["FPS_SAMPLE"],
+        video_workers=CONFIG["VIDEO_WORKERS"],
+        debug_dir=debug_dir
+    )
+    print(f"[TL] Active-speaker events: {len(timeline)}")
+
+    # Attribute & outputs
+    segments = attribute_segments(stt_segments, timeline, name_to_company)
+    attributed = sum(1 for s in segments if s.speaker)
+    validated = sum(1 for s in segments if s.speaker and s.validated)
+    print(f"[ATTRIB] segments={len(segments)} | with_speaker={attributed} | visual_validated={validated}")
 
     vtt_path = outdir / "speaker_attributed.vtt"
     json_path = outdir / "transcript_segments.json"
     qa_path = outdir / "qa_report.json"
-    write_vtt(segments, vtt_path, attendees)
+    write_vtt(segments, vtt_path, name_to_company)
     write_segments_json(segments, json_path)
     write_qa_report(segments, timeline, qa_path)
 
-    return {"vtt": str(vtt_path), "segments_json": str(json_path), "qa_report": str(qa_path)}
+    if len(timeline) == 0:
+        print("[DIAG] No blue-border speaker windows found. Adjust HSV or set VIDEO_CROP.")
 
-def main():
-    p = argparse.ArgumentParser(description="Offline Teams meeting speaker attribution & transcription (V2-multithread)")
-    # New flags
-    p.add_argument("--interactive", action="store_true", help="Prompt for paths (GUI if available; console otherwise)")
-    p.add_argument("--fps", type=float, default=2.0, help="Frame samples per second for border detection (default 2)")
-    p.add_argument("--stt-model", type=str, default="medium", help="STT model size (small/base/medium/large)")
-    p.add_argument("--prefer-faster", action="store_true", help="Prefer faster-whisper if available")
-    p.add_argument("--device", default="auto", choices=["auto","cuda","cpu"], help="STT device")
-    p.add_argument("--compute-type", default="float16", help="faster-whisper compute type (float16,int8,int8_float16, etc.)")
-    p.add_argument("--cpu-threads", type=int, default=0, help="CPU threads for decoding (0=lib default)")
-    p.add_argument("--whisper-workers", type=int, default=1, help="Parallel workers inside faster-whisper")
-    p.add_argument("--lang", default="en", help="Force STT language (default: en). Use 'auto' to let the model detect.")
-    p.add_argument("--video-workers", type=int, default=4, help="Threads for border detection compute")
-    p.add_argument("--tesseract-cmd", type=str, default=None, help="Full path to tesseract.exe if not in PATH")
-
-    # Optional positional args for paths (interactive will prompt if missing)
-    p.add_argument("--video", type=Path, help="Path to meeting video (mp4/mkv/etc.)")
-    p.add_argument("--screenshot", type=Path, help="High-res grid screenshot with names visible")
-    p.add_argument("--ics", type=Path, help="Meeting .ics file with attendees")
-    p.add_argument("--outdir", type=Path, help="Output directory")
-
-    args = p.parse_args()
-
-    # Interactive prompting if requested or any path is missing
-    if args.interactive or not all([args.video, args.screenshot, args.ics, args.outdir]):
-        args.video, args.screenshot, args.ics, args.outdir = prompt_paths_interactive(args)
-
-    language = None if (args.lang or "").lower() == "auto" else args.lang
-
-    try:
-        outputs = process_meeting(
-            video=args.video,
-            screenshot=args.screenshot,
-            ics=args.ics,
-            outdir=args.outdir,
-            stt_prefers_faster=args.prefer_faster,
-            stt_model=args.stt_model,
-            fps=args.fps,
-            device=args.device,
-            compute_type=args.compute_type,
-            cpu_threads=args.cpu_threads,
-            whisper_workers=args.whisper_workers,
-            language=language,
-            tesseract_cmd=args.tesseract_cmd,
-            video_workers=args.video_workers,
-        )
-        print(json.dumps({"status": "ok", "outputs": outputs}, indent=2))
-    except Exception as e:
-        print(json.dumps({"status": "error", "error": str(e)}))
-        sys.exit(1)
+    print(json.dumps({
+        "status": "ok",
+        "outputs": {"vtt": str(vtt_path), "segments_json": str(json_path), "qa_report": str(qa_path)}
+    }, indent=2))
 
 if __name__ == "__main__":
     main()
