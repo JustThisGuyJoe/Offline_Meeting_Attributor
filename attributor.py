@@ -657,11 +657,9 @@ def build_active_speaker_timeline(video_path: Path, tiles: List[Tile], fps: floa
         if ev.tile_name == cur.tile_name and ev.start - cur.end <= merge_tol:
             cur.end = ev.end
         else:
-            merged.append(cur)
-            cur = ev
+            merged.append(cur); cur = ev
     merged.append(cur)
 
-    # Smooth tiny gaps
     smoothed: List[SpeakerEvent] = []
     prev: Optional[SpeakerEvent] = None
     gap_tol = (1.0 / max(0.1, fps))
@@ -669,103 +667,31 @@ def build_active_speaker_timeline(video_path: Path, tiles: List[Tile], fps: floa
         if prev and ev.start - prev.end < gap_tol:
             prev.end = ev.end
         else:
-            if prev:
-                smoothed.append(prev)
+            if prev: smoothed.append(prev)
             prev = dataclasses.replace(ev)
-    if prev:
-        smoothed.append(prev)
+    if prev: smoothed.append(prev)
     return smoothed
 
-def _detect_one_frame(ts: float, frame: "np.ndarray"):
-    boxes = detect_blue_border_regions(frame)
-    return ts, boxes
-
-# ----------------------------- Alignment & Normalization -----------------------------
-VOCAB_RULES = [
-    (r"\bF[-\s]?out\b", "ephOut"),
-    (r"\bFL\b", "ephOut"),
-    (r"\bsat[-\s]?no\b", "SATNO"),
-    (r"\bOmitron\b", "Omitron"),
-    (r"\b[Ee]phemerides\b", "ephemeris"),
-]
-
-def apply_vocab_rules(text: str) -> str:
-    out = text
-    for pat, repl in VOCAB_RULES:
-        out = re.sub(pat, repl, out, flags=re.IGNORECASE)
-    return out
-
-def map_tile_to_attendee_name(tile_name: str, attendees: Dict[str, str]) -> str:
-    """Fuzzy map OCR'd tile name to a known attendee name from .ics."""
-    if not attendees:
-        return tile_name
-    choices = list(attendees.keys())
-    best = rf_process.extractOne(tile_name, choices, scorer=fuzz.WRatio)
-    if best and best[1] >= 80:
-        return best[0]
-    return tile_name
-
-def overlap(a: Tuple[float, float], b: Tuple[float, float]) -> float:
-    s1, e1 = a
-    s2, e2 = b
-    s = max(s1, s2)
-    e = min(e1, e2)
-    return max(0.0, e - s)
-
-def attribute_segments(segments: List[Dict], timeline: List[SpeakerEvent], attendees: Dict[str, str]) -> List[TranscriptSegment]:
-    """Assign speaker to each STT segment by overlapping with active-speaker windows."""
-    if not segments:
-        return []
-    events = sorted(timeline, key=lambda e: e.start)
-    out: List[TranscriptSegment] = []
-    i = 0
-    for seg in segments:
-        s_start, s_end, s_text = float(seg["start"]), float(seg["end"]), apply_vocab_rules(seg["text"])
-        s_prob = seg.get("prob", None)
-        chosen = None
-        while i < len(events) and events[i].end < s_start:
-            i += 1
-        j = i
-        best_overlap = 0.0
-        while j < len(events) and events[j].start <= s_end:
-            ov = overlap((s_start, s_end), (events[j].start, events[j].end))
-            if ov > best_overlap:
-                best_overlap = ov
-                chosen = events[j]
-            j += 1
-        if chosen:
-            mapped = map_tile_to_attendee_name(chosen.tile_name, attendees)
-            out.append(TranscriptSegment(
-                start=s_start, end=s_end, text=s_text, speaker=mapped, validated=chosen.validated, prob=s_prob
-            ))
-        else:
-            out.append(TranscriptSegment(
-                start=s_start, end=s_end, text=s_text, speaker=None, validated=False, prob=s_prob
-            ))
-    return out
+def _detect_one_frame(ts: float, frame):
+    boxes, mask = detect_blue_border_regions(frame)
+    return ts, boxes, frame if CONFIG["DEBUG"] else None, mask if CONFIG["DEBUG"] else None
 
 # ----------------------------- Outputs -----------------------------
-def write_vtt(segments: List[TranscriptSegment], out_path: Path, attendees: Dict[str, str]) -> None:
-    out_lines = ["WEBVTT", ""]
+def write_vtt(segments, out_path: Path, attendees: Dict[str, str]):
+    out_lines = ["WEBVTT",""]
     for i, seg in enumerate(segments, 1):
-        start = hhmmss(seg.start)
-        end = hhmmss(seg.end)
         speaker = seg.speaker or "UNKNOWN"
         company = attendees.get(seg.speaker or "", "")
         star = "*" if seg.validated and seg.speaker else ""
         speaker_line = f"{speaker}{star} ({company})" if company else f"{speaker}{star}"
-        text = seg.text.strip()
-        out_lines.append(str(i))
-        out_lines.append(f"{start} --> {end}")
-        out_lines.append(f"{speaker_line}: {text}")
-        out_lines.append("")
+        out_lines += [str(i), f"{hhmmss(seg.start)} --> {hhmmss(seg.end)}", f"{speaker_line}: {seg.text.strip()}", ""]
     out_path.write_text("\n".join(out_lines), encoding="utf-8")
 
-def write_segments_json(segments: List[TranscriptSegment], out_path: Path) -> None:
+def write_segments_json(segments, out_path: Path):
     data = [dataclasses.asdict(s) for s in segments]
     out_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
-def write_qa_report(segments: List[TranscriptSegment], timeline: List[SpeakerEvent], out_path: Path) -> None:
+def write_qa_report(segments, timeline, out_path: Path):
     total = len(segments)
     attributed = sum(1 for s in segments if s.speaker is not None)
     validated = sum(1 for s in segments if s.validated and s.speaker is not None)
