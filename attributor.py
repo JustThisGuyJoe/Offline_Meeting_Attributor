@@ -117,17 +117,15 @@ class FasterWhisperEngine(STTEngine):
         return out
 
 class OpenAIWhisperEngine(STTEngine):
-    def __init__(self, model_size: str = "medium"):
-        try:
-            import whisper  # type: ignore
-        except Exception as e:
-            raise RuntimeError("openai-whisper not installed. pip install openai-whisper") from e
-        import torch  # type: ignore
+    def __init__(self, model_size: str):
+        print("[STT] Loading openai-whisper...", flush=True)
+        import whisper, torch
         device = "cuda" if torch.cuda.is_available() else "cpu"
         self.model = whisper.load_model(model_size, device=device)
+        self.device = device
 
     def transcribe(self, audio_path: Path, language: Optional[str] = None) -> List[Dict]:
-        import whisper  # type: ignore
+        import whisper
         kwargs = {"verbose": False}
         if language:
             kwargs["language"] = language
@@ -142,37 +140,47 @@ class OpenAIWhisperEngine(STTEngine):
             })
         return out
 
-def stt_factory(prefer_faster: bool = True, model_size: str = "medium",
-                device: str = "auto", compute_type: str = "float16",
-                cpu_threads: int = 0, num_workers: int = 1) -> STTEngine:
-    """Choose best available STT engine with clear errors otherwise."""
-    if prefer_faster:
-        try:
-            return FasterWhisperEngine(model_size=model_size, device=device,
-                                       compute_type=compute_type, cpu_threads=cpu_threads,
-                                       num_workers=num_workers)
-        except Exception:
-            pass
+def safe_transcribe(audio: Path, language: Optional[str]):
+    used = {}
     try:
-        return OpenAIWhisperEngine(model_size=model_size)
+        fw = FasterWhisperEngine(CONFIG["STT_MODEL"], CONFIG["DEVICE"], CONFIG["COMPUTE_TYPE"],
+                                 CONFIG["CPU_THREADS"], CONFIG["WHISPER_WORKERS"])
+        print(f"[STT] Trying faster-whisper on {fw.device} ({fw.compute_type}) ...")
+        segs = fw.transcribe(audio, language=language)
+        used = {"engine": "faster-whisper", "device": fw.device, "compute_type": fw.compute_type}
+        return segs, used
     except Exception as e:
-        raise RuntimeError(
-            "No STT engine available. Install faster-whisper or openai-whisper."
-        ) from e
+        print(f"[STT] faster-whisper GPU failed: {e}")
+    try:
+        fw_cpu = FasterWhisperEngine(CONFIG["STT_MODEL"], "cpu", "int8", CONFIG["CPU_THREADS"], CONFIG["WHISPER_WORKERS"])
+        print("[STT] Retrying faster-whisper on CPU (int8) ...")
+        segs = fw_cpu.transcribe(audio, language=language)
+        used = {"engine": "faster-whisper", "device": "cpu", "compute_type": "int8"}
+        return segs, used
+    except Exception as e:
+        print(f"[STT] faster-whisper CPU failed: {e}")
+    try:
+        ow = OpenAIWhisperEngine(CONFIG["STT_MODEL"])
+        print(f"[STT] Falling back to openai-whisper on {ow.device} ...")
+        segs = ow.transcribe(audio, language=language)
+        used = {"engine": "openai-whisper", "device": ow.device}
+        return segs, used
+    except Exception as e:
+        raise RuntimeError(f"No STT engine could run: {e}")
 
 # ----------------------------- Data Models -----------------------------
 @dataclass
 class Tile:
     name: str
     bbox: Tuple[int, int, int, int]  # x, y, w, h
-    grid_pos: Tuple[int, int]  # row, col
+    grid_pos: Tuple[int, int]        # row, col
 
 @dataclass
 class SpeakerEvent:
     start: float
     end: float
-    tile_name: str  # raw name from screenshot OCR
-    validated: bool  # True if blue-border detected
+    tile_name: str
+    validated: bool
 
 @dataclass
 class TranscriptSegment:
