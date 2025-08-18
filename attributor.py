@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
+<<<<<<< Updated upstream
 attributor.py  (V2_8_1)
+=======
+attributor.py  (V2_9)
+>>>>>>> Stashed changes
 
 Purpose
 -------
@@ -11,11 +15,21 @@ Offline Teams/Zoom-style meeting attribution:
 - Generate VTT + JSON + QA report
 - GPU-first STT (faster-whisper), with CPU fallbacks
 
+<<<<<<< Updated upstream
 This patch (V2_8_1) applies:
 - FUZZ_MIN_SCORE: 60 → **55**
 - INITIALS_CONF_MIN: 60 → **50**
 - **Large-bubble initials** heuristic (accept big 2-letter tokens inside cells)
 - Keeps auto top-offset, email→name normalization, phrase assembly (1..5 tokens)
+=======
+This patch (V2_9) adds on top of V2_8_1:
+- [V2_9] Dynamic grid support (heuristic 3×3 / 4×4 / paged layouts)
+- [V2_9] Per-frame blue-border → grid-tile mapping (no fixed screenshot layout required)
+- [V2_9] Optional on-frame OCR of bottom labels to resolve names as tiles move
+- [V2_9] Transcript-only fallback when no screenshot (placeholder speaker)
+- [V2_9] Export of dynamic speaker map (JSON) with last-seen indices
+- [V2_9] New CLI flag --dynamic-grid and config toggles under CONFIG
+>>>>>>> Stashed changes
 
 Run
 ---
@@ -23,7 +37,11 @@ Run
 """
 
 from __future__ import annotations
+<<<<<<< Updated upstream
 import argparse, dataclasses, json, os, re, subprocess, sys, math
+=======
+import argparse, dataclasses, json, os, re, subprocess, sys, math, glob
+>>>>>>> Stashed changes
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -67,13 +85,29 @@ CONFIG = {
     "INITIALS_CONF_MIN": 50,      # relaxed
     "WORDS_Y_MIN_FRAC": 0.35,
 
+<<<<<<< Updated upstream
     # Grid geometry
+=======
+    # Grid geometry (static screenshot path)
+>>>>>>> Stashed changes
     "TOP_OFFSET_FRAC": 0.09,
     "AUTO_TOP_OFFSET": True,
     "GRID_INSET": 6,
 
     # Large-bubble initials heuristic
     "LARGE_BUBBLE_AREA_FRAC": 0.035,  # ~3.5% of cell area
+<<<<<<< Updated upstream
+=======
+
+    # ===================== [V2_9] Dynamic grid config =====================
+    "DYNAMIC_GRID": False,                # enable per-frame dynamic grid detection
+    "DYNAMIC_MAX_SIDE": 4,               # up to 4x4
+    "ONFRAME_OCR": True,                 # OCR within a tile's bottom strip to read the name
+    "TRANSCRIPT_ONLY_PLACEHOLDER": "UnknownSpeaker",
+    "FALLBACK_IF_NO_SCREENSHOT": True,   # if no screenshot or no OCR tiles, switch to dynamic or transcript-only
+    "EXPORT_DYNAMIC_MAP": True,
+    "DYNAMIC_NAME_CACHE_TTL": 150,       # frames to keep a name before expiring
+>>>>>>> Stashed changes
 }
 
 # ============================ Imports ============================
@@ -596,9 +630,114 @@ def attribute_segments(segments: List[Dict], timeline: List[SpeakerEvent], atten
             out.append(TranscriptSegment(start=s_start, end=s_end, text=s_text, speaker=None, validated=False, prob=s_prob))
     return out
 
+<<<<<<< Updated upstream
 # ----------------------------- Orchestrator -----------------------------
 def build_active_speaker_timeline(video_path: Path, tiles: List[Tile], fps: float,
                                   video_workers: int, debug_dir: Optional[Path]) -> List[SpeakerEvent]:
+=======
+def attribute_segments_transcript_only(segments: List[Dict], placeholder: str) -> List['TranscriptSegment']:
+    # [V2_9] transcript-only mode: single placeholder speaker, no validation
+    out: List[TranscriptSegment] = []
+    for seg in segments:
+        s_start, s_end, s_text = float(seg["start"]), float(seg["end"]), apply_vocab_rules(seg["text"])
+        s_prob = seg.get("prob", None)
+        out.append(TranscriptSegment(start=s_start, end=s_end, text=s_text, speaker=placeholder, validated=False, prob=s_prob))
+    return out
+
+# ----------------------------- [V2_9] Dynamic Grid Helper -----------------------------
+class DynamicGridAttributor:
+    """
+    [V2_9] Heuristic dynamic grid detection and name resolution.
+    Maintains a lightweight speaker map: {tile_id -> {"name": str, "last_seen": int}}.
+    """
+    def __init__(self, rows_max: int = 4, verbose: bool = True):
+        self.rows_max = max(1, rows_max)
+        self.verbose = verbose
+        self.speaker_map: Dict[int, Dict[str, Any]] = {}
+        self.frame_count = 0
+
+    def log(self, msg: str):
+        if self.verbose:
+            print(f"[DynGrid] {msg}")
+
+    def detect_grid_size(self, frame: np.ndarray) -> Tuple[int, int]:
+        # Guess grid size based on simple heuristics (square-ish tiles).
+        h, w = frame.shape[:2]
+        approx_tile = max(1, min(h, w) // self.rows_max)
+        rows = max(1, min(self.rows_max, h // max(1, approx_tile)))
+        cols = max(1, min(self.rows_max, w // max(1, approx_tile)))
+        return rows, cols
+
+    def slice_grid(self, frame: np.ndarray, rows: int, cols: int) -> Dict[int, Tuple[np.ndarray, Tuple[int,int,int,int], Tuple[int,int]]]:
+        h, w = frame.shape[:2]
+        tile_h, tile_w = h // rows, w // cols
+        tiles: Dict[int, Tuple[np.ndarray, Tuple[int,int,int,int], Tuple[int,int]]] = {}
+        tid = 0
+        for r in range(rows):
+            for c in range(cols):
+                y1, y2 = r * tile_h, (r + 1) * tile_h
+                x1, x2 = c * tile_w, (c + 1) * tile_w
+                tiles[tid] = (frame[y1:y2, x1:x2], (x1, y1, x2 - x1, y2 - y1), (r, c))
+                tid += 1
+        return tiles
+
+    def name_from_tile(self, tile_img: np.ndarray, attendees: Dict[str,str],
+                       initials_map: Dict[str, List[str]]) -> Optional[str]:
+        if not CONFIG["ONFRAME_OCR"]:
+            return None
+        # OCR only bottom strip of the tile to catch the overlay name
+        h, w = tile_img.shape[:2]
+        y1 = int(h * 0.70); y2 = max(y1+5, h-2)
+        roi = _preproc_gray(tile_img[y1:y2, :])
+        toks = _tess_data(roi, psm=7)
+        # Convert bbox to tile coordinates (for consistency unused here)
+        texts = [t for t in toks if t["conf"] >= CONFIG["OCR_WORD_CONF_MIN"] and t["text"]]
+        if not texts:
+            return None
+        texts.sort(key=lambda z: (z["bbox"][1], z["bbox"][0]))
+        line = " ".join([_clean_text(t["text"]) for t in texts])
+        line = _strip_badges(line)
+        if not line:
+            return None
+        # Direct fuzzy to attendees
+        if attendees:
+            best = rf_process.extractOne(line, list(attendees.keys()), scorer=fuzz.WRatio)
+            if best and best[1] >= CONFIG["FUZZ_MIN_SCORE"]:
+                return best[0]
+        # Initials-only fallthrough: pick any 2-letter token and map
+        for t in texts:
+            token = _clean_text(t["text"]).upper()
+            if re.fullmatch(r"[A-Z]{2}", token):
+                names = initials_map.get(token, [])
+                if len(names) == 1:
+                    return names[0]
+        return None
+
+    def update_map(self, tid: int, name: Optional[str]):
+        self.speaker_map.setdefault(tid, {"name": None, "last_seen": -1})
+        if name:
+            self.speaker_map[tid]["name"] = name
+        self.speaker_map[tid]["last_seen"] = self.frame_count
+
+    def prune_stale(self, ttl: int):
+        doomed = [tid for tid, meta in self.speaker_map.items() if (self.frame_count - meta.get("last_seen", -1)) > ttl]
+        for tid in doomed:
+            self.speaker_map.pop(tid, None)
+
+# ----------------------------- Orchestrator -----------------------------
+def build_active_speaker_timeline(video_path: Path, tiles: List[Tile], fps: float,
+                                  video_workers: int, debug_dir: Optional[Path],
+                                  dynamic_mode: bool = False,
+                                  attendees: Optional[Dict[str,str]] = None,
+                                  initials_map: Optional[Dict[str, List[str]]] = None,
+                                  dynamic_export_path: Optional[Path] = None) -> Tuple[List[SpeakerEvent], Optional[DynamicGridAttributor]]:
+    """
+    Build active-speaker timeline.
+    - Static mode: use fixed tiles from screenshot (previous behavior).
+    - Dynamic mode [V2_9]: detect grid per frame and map blue-border boxes to that grid.
+    Returns timeline and optional DynamicGridAttributor (for exporting a map).
+    """
+>>>>>>> Stashed changes
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     cap = cv2.VideoCapture(str(video_path))
@@ -614,6 +753,15 @@ def build_active_speaker_timeline(video_path: Path, tiles: List[Tile], fps: floa
     step = int(max(1, round(native_fps / max(0.1, fps))))
     idx = 0
     jobs = []
+<<<<<<< Updated upstream
+=======
+    dyn = DynamicGridAttributor(rows_max=CONFIG["DYNAMIC_MAX_SIDE"], verbose=bool(CONFIG["DEBUG"])) if dynamic_mode else None
+
+    def _detect_one_frame(ts: float, frame):
+        boxes, mask = detect_blue_border_regions(frame)
+        return ts, boxes, frame if CONFIG["DEBUG"] else None, mask if CONFIG["DEBUG"] else None, frame
+
+>>>>>>> Stashed changes
     with ThreadPoolExecutor(max_workers=max(1, video_workers)) as ex:
         while True:
             ret = cap.grab()
@@ -628,6 +776,7 @@ def build_active_speaker_timeline(video_path: Path, tiles: List[Tile], fps: floa
 
         raw_events: List[SpeakerEvent] = []
         debug_counter = 0
+<<<<<<< Updated upstream
         for fut in as_completed(jobs):
             ts, boxes, frame_dbg, mask_dbg = fut.result()
             matched = match_boxes_to_tiles(boxes, tiles)
@@ -648,6 +797,89 @@ def build_active_speaker_timeline(video_path: Path, tiles: List[Tile], fps: floa
     cap.release()
 
     if not raw_events: return []
+=======
+
+        for fut in as_completed(jobs):
+            ts, boxes, frame_dbg, mask_dbg, frame_full = fut.result()
+            if dynamic_mode and dyn is not None:
+                # [V2_9] dynamic grid per frame
+                dyn.frame_count += 1
+                rows, cols = dyn.detect_grid_size(frame_full)
+                tiles_dyn = dyn.slice_grid(frame_full, rows, cols)  # tid -> (img, bbox, (r,c))
+                # Map boxes -> tile_id via IoU, then attempt name resolution
+                for b in boxes:
+                    best_tid, best_iou = None, 0.0
+                    for tid, (_, bb, _) in tiles_dyn.items():
+                        # IoU with grid tile bbox
+                        ax, ay, aw, ah = b; bx, by, bw, bh = bb
+                        a2 = (ax+aw, ay+ah); b2 = (bx+bw, by+bh)
+                        x_left = max(ax, bx); y_top = max(ay, by)
+                        x_right = min(a2[0], b2[0]); y_bottom = min(a2[1], b2[1])
+                        if x_right <= x_left or y_bottom <= y_top:
+                            iou = 0.0
+                        else:
+                            inter = (x_right-x_left)*(y_bottom-y_top)
+                            union = aw*ah + bw*bh - inter
+                            iou = inter / max(1e-6, union)
+                        if iou > best_iou:
+                            best_iou = iou; best_tid = tid
+                    if best_tid is None or best_iou < 0.05:
+                        continue
+                    tile_img, tile_bb, (rr, cc) = tiles_dyn[best_tid]
+                    # Try to read name from tile bottom overlay
+                    name = dyn.name_from_tile(tile_img, attendees or {}, initials_map or {})
+                    if not name:
+                        # placeholder naming; can be mapped to attendees later via fuzzy
+                        name = f"Tile{rr}{cc}"
+                        if attendees:
+                            best = rf_process.extractOne(name, list(attendees.keys()), scorer=fuzz.WRatio)
+                            if best and best[1] >= CONFIG["FUZZ_MIN_SCORE"]:
+                                name = best[0]
+                    dyn.update_map(best_tid, name)
+                    raw_events.append(SpeakerEvent(start=ts, end=ts, tile_name=name, validated=True))
+                if CONFIG["DEBUG"] and debug_dir and frame_dbg is not None:
+                    if debug_counter % CONFIG["DEBUG_EVERY_N"] == 0:
+                        canvas = frame_dbg.copy()
+                        # draw dynamic grid tiles
+                        for _, bb, _ in dyn.slice_grid(frame_dbg, rows, cols).values():
+                            x,y,w,h = bb
+                            cv2.rectangle(canvas, (x,y), (x+w,y+h), (0,255,0), 1)
+                        for (x,y,w,h) in boxes:
+                            cv2.rectangle(canvas, (x,y), (x+w,y+h), (255,0,0), 2)
+                        cv2.imwrite(str(debug_dir / f"frame_{int(ts*1000):08d}.jpg"), canvas)
+                        if mask_dbg is not None:
+                            cv2.imwrite(str(debug_dir / f"mask_{int(ts*1000):08d}.png"), mask_dbg)
+                    debug_counter += 1
+            else:
+                # Static tiles path
+                matched = match_boxes_to_tiles(boxes, tiles)
+                if matched is not None:
+                    raw_events.append(SpeakerEvent(start=ts, end=ts, tile_name=matched.name, validated=True))
+                if CONFIG["DEBUG"] and debug_dir and frame_dbg is not None:
+                    if debug_counter % CONFIG["DEBUG_EVERY_N"] == 0:
+                        canvas = frame_dbg.copy()
+                        for t in tiles:
+                            x,y,w,h = t.bbox; cv2.rectangle(canvas, (x,y), (x+w,y+h), (0,255,0), 2)
+                        for (x,y,w,h) in boxes:
+                            cv2.rectangle(canvas, (x,y), (x+w,y+h), (255,0,0), 2)
+                        cv2.imwrite(str(debug_dir / f"frame_{int(ts*1000):08d}.jpg"), canvas)
+                        if mask_dbg is not None:
+                            cv2.imwrite(str(debug_dir / f"mask_{int(ts*1000):08d}.png"), mask_dbg)
+                    debug_counter += 1
+
+    cap.release()
+
+    if dynamic_mode and dyn is not None and CONFIG["EXPORT_DYNAMIC_MAP"] and dynamic_export_path:
+        try:
+            with open(dynamic_export_path, "w", encoding="utf-8") as f:
+                json.dump(dyn.speaker_map, f, indent=2)
+            print(f"[DynGrid] Exported dynamic map -> {dynamic_export_path}")
+        except Exception as e:
+            print(f"[DynGrid] Failed exporting dynamic map: {e}")
+
+    if not raw_events: 
+        return [], dyn
+>>>>>>> Stashed changes
 
     raw_events.sort(key=lambda e: e.start)
     merged: List[SpeakerEvent] = []
@@ -670,11 +902,15 @@ def build_active_speaker_timeline(video_path: Path, tiles: List[Tile], fps: floa
             if prev: smoothed.append(prev)
             prev = dataclasses.replace(ev)
     if prev: smoothed.append(prev)
+<<<<<<< Updated upstream
     return smoothed
 
 def _detect_one_frame(ts: float, frame):
     boxes, mask = detect_blue_border_regions(frame)
     return ts, boxes, frame if CONFIG["DEBUG"] else None, mask if CONFIG["DEBUG"] else None
+=======
+    return smoothed, dyn
+>>>>>>> Stashed changes
 
 # ----------------------------- Outputs -----------------------------
 def write_vtt(segments, out_path: Path, attendees: Dict[str, str]):
@@ -740,7 +976,7 @@ def _prompt_path_gui(label: str, is_dir: bool = False, filetypes=None) -> Option
         return None
     return None
 
-def prompt_paths_interactive(args) -> Tuple[Path, Path, Path, Path]:
+def prompt_paths_interactive(args) -> Tuple[Path, Optional[Path], Path, Path]:
     video = args.video if isinstance(args.video, Path) else None
     screenshot = args.screenshot if isinstance(args.screenshot, Path) else None
     ics = args.ics if isinstance(args.ics, Path) else None
@@ -751,9 +987,16 @@ def prompt_paths_interactive(args) -> Tuple[Path, Path, Path, Path]:
                                  filetypes=[("Video", "*.mp4 *.mkv *.mov *.avi"), ("All", "*.*")]) \
                 or _prompt_path_console("Drop meeting video path")
     if not screenshot:
-        screenshot = _prompt_path_gui("Select meeting grid screenshot (PNG/JPG)",
-                                      filetypes=[("Images", "*.png *.jpg *.jpeg"), ("All", "*.*")]) \
-                    or _prompt_path_console("Drop screenshot path")
+        screenshot = _prompt_path_gui("Select meeting grid screenshot (PNG/JPG) [optional]",
+                                      filetypes=[("Images", "*.png *.jpg *.jpeg"), ("All", "*.*")])
+        # console prompt only if still missing and user wants to supply
+        if not screenshot:
+            print("[INPUT] No screenshot selected (ok). Press Enter to continue without, or paste a path to use one.")
+            raw = input("> ").strip().strip('"').strip("'")
+            if raw:
+                p = Path(raw).expanduser().resolve()
+                if p.is_file():
+                    screenshot = p
     if not ics:
         ics = _prompt_path_gui("Select meeting .ics file", filetypes=[("ICS", "*.ics"), ("All", "*.*")]) \
               or _prompt_path_console("Drop .ics path")
@@ -765,6 +1008,7 @@ def prompt_paths_interactive(args) -> Tuple[Path, Path, Path, Path]:
 
 # ----------------------------- Main -----------------------------
 def main():
+<<<<<<< Updated upstream
     p = argparse.ArgumentParser(description="V2.8.1: relaxed thresholds + large-bubble initials")
     p.add_argument("--interactive", action="store_true")
     p.add_argument("--video", type=Path)
@@ -775,6 +1019,23 @@ def main():
 
     if args.interactive or not all([args.video, args.screenshot, args.ics, args.outdir]):
         args.video, args.screenshot, args.ics, args.outdir = prompt_paths_interactive(args)
+=======
+    p = argparse.ArgumentParser(description="V2.9: dynamic grid + transcript-only fallback + on-frame OCR")
+    p.add_argument("--interactive", action="store_true")
+    p.add_argument("--video", type=Path)
+    p.add_argument("--screenshot", type=Path)  # optional in V2_9
+    p.add_argument("--ics", type=Path)
+    p.add_argument("--outdir", type=Path)
+    p.add_argument("--dynamic-grid", action="store_true", help="[V2_9] enable dynamic grid mode")
+    args = p.parse_args()
+
+    if args.interactive or not args.video or not args.ics or not args.outdir:
+        args.video, args.screenshot, args.ics, args.outdir = prompt_paths_interactive(args)
+
+    # Apply CLI override
+    if args.dynamic_grid:
+        CONFIG["DYNAMIC_GRID"] = True
+>>>>>>> Stashed changes
 
     try:
         import torch
@@ -789,6 +1050,7 @@ def main():
     name_to_company, email_to_name, initials_map = parse_ics_attendees_extended(args.ics)
     print(f"[ICS] Attendees parsed: {len(name_to_company)} names, {len(email_to_name)} emails")
 
+<<<<<<< Updated upstream
     # OCR -> tiles
     kept, shot_size, top_off = ocr_to_tiles(args.screenshot, name_to_company, email_to_name, initials_map, outdir=outdir)
     print(f"[OCR] Tiles from tokens: {len(kept)} | screenshot size={shot_size}")
@@ -800,6 +1062,28 @@ def main():
     for i, t in enumerate(tiles):
         tiles[i] = Tile(name=t.name, bbox=t.bbox, grid_pos=(i//3, i%3))
     print(f"[GRID] Tiles built: {len(tiles)}")
+=======
+    tiles = []
+    shot_size = None
+
+    # OCR -> tiles when screenshot present
+    if args.screenshot and Path(args.screenshot).exists():
+        try:
+            kept, shot_size, top_off = ocr_to_tiles(args.screenshot, name_to_company, email_to_name, initials_map, outdir=outdir)
+            print(f"[OCR] Tiles from tokens: {len(kept)} | screenshot size={shot_size}")
+            if kept[:9]:
+                print("     Sample:", [n for n,_ in kept[:9]])
+            tiles = [Tile(name=n, bbox=bb, grid_pos=(0,0)) for n,bb in kept]
+            tiles.sort(key=lambda t: (t.bbox[1], t.bbox[0]))
+            for i, t in enumerate(tiles):
+                tiles[i] = Tile(name=t.name, bbox=t.bbox, grid_pos=(i//3, i%3))
+            print(f"[GRID] Tiles built (static): {len(tiles)}}")
+        except Exception as e:
+            print(f"[OCR] Failed to build tiles from screenshot: {e}")
+            tiles = []
+    else:
+        print("[OCR] No screenshot provided.")
+>>>>>>> Stashed changes
 
     # Video size
     cap_sz = cv2.VideoCapture(str(args.video))
@@ -809,7 +1093,14 @@ def main():
     cap_sz.release()
     dst_size = (vw, vh) if not CONFIG["VIDEO_CROP"] else (CONFIG["VIDEO_CROP"][2], CONFIG["VIDEO_CROP"][3])
     print(f"[VIDEO] size={vw}x{vh} | target grid size={dst_size} | crop={CONFIG['VIDEO_CROP']}")
+<<<<<<< Updated upstream
     tiles_scaled = scale_tiles_to_frame(tiles, shot_size, dst_size)
+=======
+
+    tiles_scaled = []
+    if tiles and shot_size:
+        tiles_scaled = scale_tiles_to_frame(tiles, shot_size, dst_size)
+>>>>>>> Stashed changes
 
     # Audio -> STT
     wav_path = outdir / "audio_16k.wav"
@@ -820,17 +1111,44 @@ def main():
     # Timeline & debug
     debug_dir = outdir / "debug" if CONFIG["DEBUG"] else None
     if debug_dir: debug_dir.mkdir(parents=True, exist_ok=True)
+<<<<<<< Updated upstream
     timeline = build_active_speaker_timeline(
+=======
+
+    dynamic_export_path = outdir / "dynamic_speaker_map.json" if CONFIG["EXPORT_DYNAMIC_MAP"] else None
+
+    use_dynamic = CONFIG["DYNAMIC_GRID"] or (CONFIG["FALLBACK_IF_NO_SCREENSHOT"] and not tiles_scaled)
+    timeline, dyn = build_active_speaker_timeline(
+>>>>>>> Stashed changes
         video_path=args.video,
         tiles=tiles_scaled,
         fps=CONFIG["FPS_SAMPLE"],
         video_workers=CONFIG["VIDEO_WORKERS"],
+<<<<<<< Updated upstream
         debug_dir=debug_dir
     )
     print(f"[TL] Active-speaker events: {len(timeline)}")
 
     # Attribute & outputs
     segments = attribute_segments(stt_segments, timeline, name_to_company)
+=======
+        debug_dir=debug_dir,
+        dynamic_mode=use_dynamic,
+        attendees=name_to_company,
+        initials_map=initials_map,
+        dynamic_export_path=dynamic_export_path
+    )
+    print(f"[TL] Active-speaker events: {len(timeline)} (mode={'dynamic' if use_dynamic else 'static'})")
+
+    # Attribute & outputs
+    if use_dynamic and not timeline and CONFIG["FALLBACK_IF_NO_SCREENSHOT"]:
+        # [V2_9] ultimate fallback: transcript-only placeholder
+        print("[ATTRIB] Dynamic/static detection yielded no events; using transcript-only mode.")
+        segments = attribute_segments_transcript_only(stt_segments, CONFIG["TRANSCRIPT_ONLY_PLACEHOLDER"])
+    else:
+        segments = attribute_segments(stt_segments, timeline, name_to_company)
+
+>>>>>>> Stashed changes
     attributed = sum(1 for s in segments if s.speaker)
     validated = sum(1 for s in segments if s.speaker and s.validated)
     print(f"[ATTRIB] segments={len(segments)} | with_speaker={attributed} | visual_validated={validated}")
@@ -843,11 +1161,25 @@ def main():
     write_qa_report(segments, timeline, qa_path)
 
     if len(timeline) == 0:
+<<<<<<< Updated upstream
         print("[DIAG] No blue-border speaker windows found. Adjust HSV or set VIDEO_CROP.")
 
     print(json.dumps({
         "status": "ok",
         "outputs": {"vtt": str(vtt_path), "segments_json": str(json_path), "qa_report": str(qa_path)}
+=======
+        print("[DIAG] No blue-border speaker windows found. Adjust HSV or enable --dynamic-grid or set VIDEO_CROP.")
+
+    print(json.dumps({
+        "status": "ok",
+        "mode": "dynamic" if use_dynamic else "static",
+        "outputs": {
+            "vtt": str(vtt_path),
+            "segments_json": str(json_path),
+            "qa_report": str(qa_path),
+            "dynamic_map": str(dynamic_export_path) if dynamic_export_path else None
+        }
+>>>>>>> Stashed changes
     }, indent=2))
 
 if __name__ == "__main__":
