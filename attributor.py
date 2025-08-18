@@ -704,12 +704,13 @@ def write_qa_report(segments, timeline, out_path: Path):
         "speaker_windows_found": len(timeline),
     }
     out_path.write_text(json.dumps(coverage, indent=2), encoding="utf-8")
+    print("[REPORT]", json.dumps(coverage))
 
-# ----------------------------- Interactive Prompts -----------------------------
+# ----------------------------- Interactive -----------------------------
 def _try_tk():
     try:
-        import tkinter as _tk  # type: ignore
-        from tkinter import filedialog as _fd  # type: ignore
+        import tkinter as _tk
+        from tkinter import filedialog as _fd
         return _tk, _fd
     except Exception:
         return None, None
