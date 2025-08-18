@@ -1,103 +1,105 @@
 #!/usr/bin/env python3
 """
-offline_meeting_attributor_V2_multithread.py
+attributor.py  (V2_8_1)
 
-Purpose:
-    GPU-friendly, fully offline pipeline to generate a speaker-attributed transcript from a
-    Teams-style meeting video, using blue-border active speaker detection + audio transcription.
-    This V2-multithread build adds interactive prompting, CUDA controls, language forcing,
-    robust .ics parsing, and multithreaded border detection.
+Purpose
+-------
+Offline Teams/Zoom-style meeting attribution:
+- Parse .ics attendees (names, emails, companies)
+- OCR screenshot (tokens + cell-bottom labels) → infer 3×3 tiles
+- Detect active speaker via blue border and attribute transcript segments
+- Generate VTT + JSON + QA report
+- GPU-first STT (faster-whisper), with CPU fallbacks
 
-Key features:
-    - Interactive mode: prompts for video/screenshot/.ics/outdir (GUI picker if Tkinter available;
-      console fallback supports drag-and-drop paths).
-    - Parses .ics attendee names + infers company from email domain (e.g., omitron.com -> Omitron).
-    - OCRs high-res grid screenshot to map participant tiles & name bboxes (Tesseract).
-    - Detects blue-border active speaker from sampled frames; tolerant of curved monitors.
-    - Multithreaded frame processing for border detection (single reader, threaded compute).
-    - Transcribes audio locally (prefers faster-whisper on CUDA; openai-whisper fallback).
-    - CLI flags for device (auto/cuda/cpu), compute-type, workers, cpu threads, and language.
-    - Vocabulary normalization: ephOut, SATNO, Omitron, ephemeris.
-    - Outputs:
-        * speaker_attributed.vtt
-        * transcript_segments.json
-        * qa_report.json
+This patch (V2_8_1) applies:
+- FUZZ_MIN_SCORE: 60 → **55**
+- INITIALS_CONF_MIN: 60 → **50**
+- **Large-bubble initials** heuristic (accept big 2-letter tokens inside cells)
+- Keeps auto top-offset, email→name normalization, phrase assembly (1..5 tokens)
 
-CLI example:
-    python offline_meeting_attributor_V2_multithread.py --interactive \
-      --prefer-faster --device cuda --compute-type float16 --whisper-workers 2 \
-      --video-workers 4 --lang en
-
-Dependencies:
-    pip install opencv-python numpy pillow rapidfuzz icalendar python-dateutil pytesseract
-    pip install faster-whisper  # preferred for GPU
-    # optional fallback:
-    pip install openai-whisper
-
-External tools:
-    - ffmpeg (in PATH)
-    - Tesseract OCR binary (in PATH); or set TESSERACT_CMD or --tesseract-cmd
+Run
+---
+    python attributor.py --interactive
+"""
 
 from __future__ import annotations
-
-import argparse
-import dataclasses
-import json
-import math
-import os
-import re
-import subprocess
-import sys
+import argparse, dataclasses, json, os, re, subprocess, sys, math
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 
-# Optional heavy deps — loaded lazily
-try:
-    import cv2  # type: ignore
-except Exception:
-    cv2 = None
-try:
-    import numpy as np  # type: ignore
-except Exception:
-    np = None
-try:
-    from PIL import Image  # noqa: F401
-except Exception:
-    Image = None
-try:
-    import pytesseract  # type: ignore
-except Exception:
-    pytesseract = None
-try:
-    from icalendar import Calendar  # type: ignore
-except Exception:
-    Calendar = None
-try:
-    from rapidfuzz import fuzz, process as rf_process  # type: ignore
-except Exception:
-    fuzz = None
-    rf_process = None
+# ============================== CONFIG ==============================
+CONFIG = {
+    "LANGUAGE": "en",
+    "PREFER_FASTER": True,
+    "STT_MODEL": "medium",
+    "DEVICE": "cuda",
+    "COMPUTE_TYPE": "float16",
+    "CPU_THREADS": 0,
+    "WHISPER_WORKERS": 2,
+
+    "FPS_SAMPLE": 3.0,
+    "VIDEO_WORKERS": 4,
+
+    # Blue border HSV (Teams blue)
+    "LOWER_HSV": (95, 70, 70),
+    "UPPER_HSV": (135, 255, 255),
+
+    "MIN_BOX_W": 30,
+    "MIN_BOX_H": 30,
+    "MIN_AREA": 150,
+    "MAX_STROKE_RATIO": 0.30,
+
+    "VIDEO_CROP": None,           # (x,y,w,h) or None
+
+    "TESSERACT_CMD": None,
+
+    "DEBUG": True,
+    "DEBUG_EVERY_N": 15,
+
+    # OCR tuning
+    "OCR_LANG": "eng",
+    "OCR_ALLOWED_RE": r"[^A-Za-z0-9 .,'()@\-\[\]]",
+    "OCR_MIN_LEN": 2,
+    "FUZZ_MIN_SCORE": 55,         # relaxed
+    "OCR_WORD_CONF_MIN": 50,
+    "INITIALS_CONF_MIN": 50,      # relaxed
+    "WORDS_Y_MIN_FRAC": 0.35,
+
+    # Grid geometry
+    "TOP_OFFSET_FRAC": 0.09,
+    "AUTO_TOP_OFFSET": True,
+    "GRID_INSET": 6,
+
+    # Large-bubble initials heuristic
+    "LARGE_BUBBLE_AREA_FRAC": 0.035,  # ~3.5% of cell area
+}
+
+# ============================ Imports ============================
+import numpy as np
+import cv2
+from PIL import Image  # noqa: F401
+import pytesseract
+from icalendar import Calendar
+from rapidfuzz import fuzz, process as rf_process
 
 # ----------------------------- STT Engines -----------------------------
 class STTEngine:
-    """Abstract STT engine interface."""
     def transcribe(self, audio_path: Path, language: Optional[str] = None) -> List[Dict]:
         raise NotImplementedError
 
 class FasterWhisperEngine(STTEngine):
-    def __init__(self, model_size: str = "medium", device: Optional[str] = None,
-                 compute_type: str = "float16", cpu_threads: int = 0, num_workers: int = 1):
-        try:
-            from faster_whisper import WhisperModel  # type: ignore
-        except Exception as e:
-            raise RuntimeError("faster-whisper not installed. pip install faster-whisper") from e
+    def __init__(self, model_size: str, device: str, compute_type: str, cpu_threads: int, num_workers: int):
+        print("[STT] Loading faster-whisper...", flush=True)
+        from faster_whisper import WhisperModel
         self.model = WhisperModel(model_size,
                                   device=device or "auto",
                                   compute_type=compute_type,
                                   cpu_threads=cpu_threads,
                                   num_workers=num_workers)
+        self.device = device
+        self.compute_type = compute_type
 
     def transcribe(self, audio_path: Path, language: Optional[str] = None) -> List[Dict]:
         kwargs = {"vad_filter": True}
