@@ -551,21 +551,18 @@ def ocr_to_tiles(screenshot_path: Path, attendees_name_to_company: Dict[str,str]
         x, y, w, h = bb
         return _tile_bbox_from_point_grid(x + w/2.0, y + h/2.0)
 
-    # Debug overlay of OCR tokens + detected grid box
-    dbg = img.copy()
-    for w in words_keep:
-        x, y, ww, hh = w["bbox"]
-        cv2.rectangle(dbg, (x, y), (x + ww, y + hh), (0, 255, 255), 1)
-    # draw detected grid bounds in magenta
-    cv2.rectangle(dbg, (grid_left, top_off), (grid_right, H), (255, 0, 255), 2)
-    cv2.imwrite(str(outdir / "ocr_tokens_v2.png"), dbg)
-    print(f"[OCRDBG] Tokens (grid) conf>={CONFIG['OCR_WORD_CONF_MIN']}: {len(words_keep)} | grid_left/right=({grid_left},{grid_right})")
-
-    name_to_company = attendees_name_to_company
-    attendee_names = list(name_to_company.keys())
-
-    kept_tiles: Dict[str, Tuple[int, int, int, int]] = {}
-    kept_score: Dict[str, float] = {}
+# Debug overlay of OCR tokens + detected grid box
+dbg = img.copy()
+for w in words_keep:
+    x, y, ww, hh = w["bbox"]
+    cv2.rectangle(dbg, (x, y), (x + ww, y + hh), (0, 255, 255), 1)
+# use k-means bounds
+cv2.rectangle(dbg, (int(cL), int(rT)), (int(cR), int(rB)), (255, 0, 255), 2)
+cv2.imwrite(str(outdir / "ocr_tokens_v2.png"), dbg)
+print(
+    f"[OCRDBG] Tokens conf>={CONFIG['OCR_WORD_CONF_MIN']}: {len(words_keep)} | "
+    f"cols L/M1/M2/R=({cL},{cM1},{cM2},{cR}) | rows T/M1/M2/B=({rT},{rM1},{rM2},{rB})"
+)
 
     # ---------------- Initials-first + large-bubble heuristic ----------------
     init_hits = 0
