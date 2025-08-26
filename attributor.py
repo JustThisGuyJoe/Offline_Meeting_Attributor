@@ -662,9 +662,9 @@ print(
 
     print(f"[OCRDBG] Phrase attempts={phrase_attempts} accepted={phrase_hits}")
 
-    # --- COLLAPSE: keep one best candidate per (row, col) cell ---
-    # Prefer the grid-aware mapper if present; otherwise fall back to the older 3x3-from-top_off mapper.
-    _map_bbox = globals().get("_tile_bbox_from_bbox_grid", None)
+# --- COLLAPSE: keep one best candidate per (row, col) cell ---
+_map_bbox = _tile_bbox_from_bbox_grid  # use the k-means-aware mapper
+# (fallback would be: lambda bb: _tile_bbox_from_bbox(bb, W, H, top_off))
     if _map_bbox is None:
         def _map_bbox(bb):
             return _tile_bbox_from_bbox(bb, W, H, top_off)
