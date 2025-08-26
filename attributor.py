@@ -1219,18 +1219,6 @@ def prompt_paths_interactive(args) -> Tuple[Path, Optional[Path], Path, Path]:
 
 # ----------------------------- Main -----------------------------
 def main():
-<<<<<<< Updated upstream
-    p = argparse.ArgumentParser(description="V2.8.1: relaxed thresholds + large-bubble initials")
-    p.add_argument("--interactive", action="store_true")
-    p.add_argument("--video", type=Path)
-    p.add_argument("--screenshot", type=Path)
-    p.add_argument("--ics", type=Path)
-    p.add_argument("--outdir", type=Path)
-    args = p.parse_args()
-
-    if args.interactive or not all([args.video, args.screenshot, args.ics, args.outdir]):
-        args.video, args.screenshot, args.ics, args.outdir = prompt_paths_interactive(args)
-=======
     p = argparse.ArgumentParser(description="V2.9: dynamic grid + transcript-only fallback + on-frame OCR")
     p.add_argument("--interactive", action="store_true")
     p.add_argument("--video", type=Path)
@@ -1240,13 +1228,17 @@ def main():
     p.add_argument("--dynamic-grid", action="store_true", help="[V2_9] enable dynamic grid mode")
     args = p.parse_args()
 
+    # --- Toggle dynamic grid without CLI ---
+    env_val = os.getenv("ATTRIB_DYNAMIC_GRID")
+    if env_val is not None:
+        CONFIG["DYNAMIC_GRID"] = env_val.strip().lower() in ("1", "true", "yes", "on")
+
     if args.interactive or not args.video or not args.ics or not args.outdir:
         args.video, args.screenshot, args.ics, args.outdir = prompt_paths_interactive(args)
 
     # Apply CLI override
     if args.dynamic_grid:
         CONFIG["DYNAMIC_GRID"] = True
->>>>>>> Stashed changes
 
     try:
         import torch
@@ -1261,19 +1253,6 @@ def main():
     name_to_company, email_to_name, initials_map = parse_ics_attendees_extended(args.ics)
     print(f"[ICS] Attendees parsed: {len(name_to_company)} names, {len(email_to_name)} emails")
 
-<<<<<<< Updated upstream
-    # OCR -> tiles
-    kept, shot_size, top_off = ocr_to_tiles(args.screenshot, name_to_company, email_to_name, initials_map, outdir=outdir)
-    print(f"[OCR] Tiles from tokens: {len(kept)} | screenshot size={shot_size}")
-    if kept[:9]:
-        print("     Sample:", [n for n,_ in kept[:9]])
-
-    tiles = [Tile(name=n, bbox=bb, grid_pos=(0,0)) for n,bb in kept]
-    tiles.sort(key=lambda t: (t.bbox[1], t.bbox[0]))
-    for i, t in enumerate(tiles):
-        tiles[i] = Tile(name=t.name, bbox=t.bbox, grid_pos=(i//3, i%3))
-    print(f"[GRID] Tiles built: {len(tiles)}")
-=======
     tiles = []
     shot_size = None
 
