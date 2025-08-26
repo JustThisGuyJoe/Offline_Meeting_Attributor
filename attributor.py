@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
 """
-<<<<<<< Updated upstream
-attributor.py  (V2_8_1)
-=======
 attributor.py  (V2_9)
->>>>>>> Stashed changes
 
 Purpose
 -------
@@ -15,13 +11,6 @@ Offline Teams/Zoom-style meeting attribution:
 - Generate VTT + JSON + QA report
 - GPU-first STT (faster-whisper), with CPU fallbacks
 
-<<<<<<< Updated upstream
-This patch (V2_8_1) applies:
-- FUZZ_MIN_SCORE: 60 → **55**
-- INITIALS_CONF_MIN: 60 → **50**
-- **Large-bubble initials** heuristic (accept big 2-letter tokens inside cells)
-- Keeps auto top-offset, email→name normalization, phrase assembly (1..5 tokens)
-=======
 This patch (V2_9) adds on top of V2_8_1:
 - [V2_9] Dynamic grid support (heuristic 3×3 / 4×4 / paged layouts)
 - [V2_9] Per-frame blue-border → grid-tile mapping (no fixed screenshot layout required)
@@ -29,7 +18,6 @@ This patch (V2_9) adds on top of V2_8_1:
 - [V2_9] Transcript-only fallback when no screenshot (placeholder speaker)
 - [V2_9] Export of dynamic speaker map (JSON) with last-seen indices
 - [V2_9] New CLI flag --dynamic-grid and config toggles under CONFIG
->>>>>>> Stashed changes
 
 Run
 ---
@@ -37,11 +25,7 @@ Run
 """
 
 from __future__ import annotations
-<<<<<<< Updated upstream
-import argparse, dataclasses, json, os, re, subprocess, sys, math
-=======
 import argparse, dataclasses, json, os, re, subprocess, sys, math, glob
->>>>>>> Stashed changes
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -1077,13 +1061,12 @@ def main():
             tiles.sort(key=lambda t: (t.bbox[1], t.bbox[0]))
             for i, t in enumerate(tiles):
                 tiles[i] = Tile(name=t.name, bbox=t.bbox, grid_pos=(i//3, i%3))
-            print(f"[GRID] Tiles built (static): {len(tiles)}}")
+            print(f"[GRID] Tiles built (static): {len(tiles)}")
         except Exception as e:
             print(f"[OCR] Failed to build tiles from screenshot: {e}")
             tiles = []
     else:
         print("[OCR] No screenshot provided.")
->>>>>>> Stashed changes
 
     # Video size
     cap_sz = cv2.VideoCapture(str(args.video))
