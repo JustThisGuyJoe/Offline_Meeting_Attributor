@@ -1282,14 +1282,10 @@ def main():
     cap_sz.release()
     dst_size = (vw, vh) if not CONFIG["VIDEO_CROP"] else (CONFIG["VIDEO_CROP"][2], CONFIG["VIDEO_CROP"][3])
     print(f"[VIDEO] size={vw}x{vh} | target grid size={dst_size} | crop={CONFIG['VIDEO_CROP']}")
-<<<<<<< Updated upstream
-    tiles_scaled = scale_tiles_to_frame(tiles, shot_size, dst_size)
-=======
 
     tiles_scaled = []
     if tiles and shot_size:
         tiles_scaled = scale_tiles_to_frame(tiles, shot_size, dst_size)
->>>>>>> Stashed changes
 
     # Audio -> STT
     wav_path = outdir / "audio_16k.wav"
@@ -1300,27 +1296,15 @@ def main():
     # Timeline & debug
     debug_dir = outdir / "debug" if CONFIG["DEBUG"] else None
     if debug_dir: debug_dir.mkdir(parents=True, exist_ok=True)
-<<<<<<< Updated upstream
-    timeline = build_active_speaker_timeline(
-=======
 
     dynamic_export_path = outdir / "dynamic_speaker_map.json" if CONFIG["EXPORT_DYNAMIC_MAP"] else None
 
     use_dynamic = CONFIG["DYNAMIC_GRID"] or (CONFIG["FALLBACK_IF_NO_SCREENSHOT"] and not tiles_scaled)
     timeline, dyn = build_active_speaker_timeline(
->>>>>>> Stashed changes
         video_path=args.video,
         tiles=tiles_scaled,
         fps=CONFIG["FPS_SAMPLE"],
         video_workers=CONFIG["VIDEO_WORKERS"],
-<<<<<<< Updated upstream
-        debug_dir=debug_dir
-    )
-    print(f"[TL] Active-speaker events: {len(timeline)}")
-
-    # Attribute & outputs
-    segments = attribute_segments(stt_segments, timeline, name_to_company)
-=======
         debug_dir=debug_dir,
         dynamic_mode=use_dynamic,
         attendees=name_to_company,
@@ -1337,7 +1321,6 @@ def main():
     else:
         segments = attribute_segments(stt_segments, timeline, name_to_company)
 
->>>>>>> Stashed changes
     attributed = sum(1 for s in segments if s.speaker)
     validated = sum(1 for s in segments if s.speaker and s.validated)
     print(f"[ATTRIB] segments={len(segments)} | with_speaker={attributed} | visual_validated={validated}")
@@ -1350,13 +1333,6 @@ def main():
     write_qa_report(segments, timeline, qa_path)
 
     if len(timeline) == 0:
-<<<<<<< Updated upstream
-        print("[DIAG] No blue-border speaker windows found. Adjust HSV or set VIDEO_CROP.")
-
-    print(json.dumps({
-        "status": "ok",
-        "outputs": {"vtt": str(vtt_path), "segments_json": str(json_path), "qa_report": str(qa_path)}
-=======
         print("[DIAG] No blue-border speaker windows found. Adjust HSV or enable --dynamic-grid or set VIDEO_CROP.")
 
     print(json.dumps({
@@ -1368,7 +1344,6 @@ def main():
             "qa_report": str(qa_path),
             "dynamic_map": str(dynamic_export_path) if dynamic_export_path else None
         }
->>>>>>> Stashed changes
     }, indent=2))
 
 if __name__ == "__main__":
