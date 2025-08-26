@@ -965,12 +965,10 @@ def build_active_speaker_timeline(
     with ThreadPoolExecutor(max_workers=max(1, video_workers)) as ex:
         while True:
             ret = cap.grab()
-            if not ret:
-                break
+            if not ret: break
             if idx % step == 0:
                 ret, frame = cap.retrieve()
-                if not ret or frame is None:
-                    break
+                if not ret or frame is None: break
                 ts = idx / native_fps
                 frame = crop_frame(frame)
                 jobs.append(ex.submit(_detect_one_frame, ts, frame))
@@ -1103,11 +1101,9 @@ def build_active_speaker_timeline(
         if ev.tile_name == cur.tile_name and ev.start - cur.end <= merge_tol:
             cur.end = ev.end
         else:
-            merged.append(cur)
-            cur = ev
+            merged.append(cur); cur = ev
     merged.append(cur)
 
-    # Smooth tiny gaps
     smoothed: List[SpeakerEvent] = []
     prev: Optional[SpeakerEvent] = None
     gap_tol = (1.0 / max(0.1, fps))
@@ -1115,8 +1111,7 @@ def build_active_speaker_timeline(
         if prev and ev.start - prev.end < gap_tol:
             prev.end = ev.end
         else:
-            if prev:
-                smoothed.append(prev)
+            if prev: smoothed.append(prev)
             prev = dataclasses.replace(ev)
     if prev:
         smoothed.append(prev)
