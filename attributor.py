@@ -346,17 +346,35 @@ def _tess_data(img, psm: int) -> List[Dict[str, Any]]:
     return out
 
 def _auto_top_offset(gray: np.ndarray) -> int:
-    if not CONFIG["AUTO_TOP_OFFSET"]: return int(CONFIG["TOP_OFFSET_FRAC"] * gray.shape[0])
-    H, W = gray.shape[:2]
-    # gradient magnitude per row
+    """
+    [V2_9_1] Robustly pick the top of the grid (exclude window chrome).
+    - Smooth row energy to avoid picking icon clusters in the top bar.
+    - Add a small downward bias.
+    - Clamp to a safe band [AUTO_TOP_MIN_FRAC..AUTO_TOP_MAX_FRAC] of H.
+    """
+    if not CONFIG["AUTO_TOP_OFFSET"]:
+        return int(CONFIG["TOP_OFFSET_FRAC"] * gray.shape[0])
+
+    H = gray.shape[0]
+    # Edge energy per row
     gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
     gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
     mag = cv2.magnitude(gx, gy)
     row_energy = mag.mean(axis=1)
-    search_to = int(0.2 * H)
-    if search_to < 10: return int(CONFIG["TOP_OFFSET_FRAC"] * H)
-    idx = np.argmax(row_energy[:search_to])
-    off = int(min(max(idx + 10, H*0.06), H*0.15))
+
+    search_to = int(0.25 * H)
+    if search_to < 10:
+        return int(CONFIG["TOP_OFFSET_FRAC"] * H)
+
+    # Smooth to avoid spurious icon peaks
+    k = max(3, (int(0.01 * H) | 1))  # odd
+    row_energy_s = cv2.GaussianBlur(row_energy.astype(np.float32), (k, 1), 0)
+
+    idx = int(np.argmax(row_energy_s[:search_to]))
+    extra = int(CONFIG["AUTO_TOP_EXTRA_FRAC"] * H)
+    lo = int(CONFIG["AUTO_TOP_MIN_FRAC"] * H)
+    hi = int(CONFIG["AUTO_TOP_MAX_FRAC"] * H)
+    off = max(lo, min(hi, idx + extra))
     return off
 
 def _cell_bbox_from_point(cx, cy, W, H, top_off):
@@ -385,95 +403,209 @@ def _strip_badges(t: str) -> str:
     t = re.sub(r"\[[^\]]+\]", " ", t)
     t = re.sub(r"\([^\)]+\)", " ", t)
     return re.sub(r"\s{2,}", " ", t).strip()
+    
+def _normalize_label_for_match(text: str) -> str:
+    """Normalize Zoom/Teams labels for fuzzy matching."""
+    # remove badges like [US-US] or (Unverified)
+    t = re.sub(r"\[[^\]]+\]|\([^)]+\)", " ", text)
+    t = re.sub(r"\s{2,}", " ", t).strip()
+    # flip "Last, First" → "First Last"
+    m = re.match(r"^([A-Za-z.'-]+),\s*([A-Za-z.'-]+)$", t)
+    if m:
+        t = f"{m.group(2)} {m.group(1)}"
+    return t
 
 def ocr_to_tiles(screenshot_path: Path, attendees_name_to_company: Dict[str,str],
                  email_to_name: Dict[str,str], initials_map: Dict[str,List[str]], outdir: Path):
+    """
+    [V2_9_3]
+    - Pass A: OCR on grid region (excludes header)
+    - Pass B: OCR per-cell bottom strips (taller band; lighter bottom pad)
+    - Pass C: Per-cell center initials (PSM=8) to capture avatars like AT/TA/JR
+    - NEW: infer true grid left/right bounds from bottom-band tokens (fixes global left shift)
+    - Collapse to one winner per cell (prevents overlaps)
+    """
     set_tesseract_cmd_if_provided()
     img = cv2.imread(str(screenshot_path))
-    if img is None: raise RuntimeError(f"Failed to read screenshot: {screenshot_path}")
+    if img is None:
+        raise RuntimeError(f"Failed to read screenshot: {screenshot_path}")
+
     H, W = img.shape[:2]
     gray = _preproc_gray(img)
     top_off = _auto_top_offset(gray)
     print(f"[GRID] top_offset={top_off} (auto={'on' if CONFIG['AUTO_TOP_OFFSET'] else 'off'})")
 
-    # Pass A: full image PSM6
-    wordsA = _tess_data(gray, psm=6)
-    # Pass B: bottom strips per cell PSM7
-    strips = []
-    grid_h = H - top_off
+    # Initial 3×3 geometry (temporary; we will refine L/R below)
+    grid_h = max(1, H - top_off)
     tile_h = int(grid_h / 3.0)
-    tile_w = int(W / 3.0)
-    for r in range(3):
-        y1 = top_off + r*tile_h + int(tile_h*0.72)
-        y2 = top_off + (r+1)*tile_h - int(tile_h*0.05)
-        y1 = max(top_off, min(H-1, y1)); y2 = max(y1+5, min(H, y2))
-        strips.append((y1, y2))
+    tile_w_tmp = int(W / 3.0)
+
+    # ---------------- Pass A: OCR on GRID ONLY ----------------
+    roi_full = gray[top_off:H, :]
+    wordsA = _tess_data(roi_full, psm=6)
+    for w in wordsA:
+        x, y, wid, hei = w["bbox"]
+        w["bbox"] = (x, top_off + y, wid, hei)  # restore absolute coords
+
+    # ---------------- Pass B: OCR bottom strips per cell ----------------
+    pad_b = float(CONFIG.get("BOTTOM_STRIP_PAD_BOTTOM_FRAC", 0.015))
+    bs_frac = float(CONFIG.get("BOTTOM_STRIP_FRAC", 0.58))
     wordsB = []
     for r in range(3):
-        for c in range(3):
-            x1 = c*tile_w; x2 = (c+1)*tile_w
-            y1,y2 = strips[r]
-            roi = gray[y1:y2, x1:x2]
-            if roi.size == 0: continue
-            data = _tess_data(roi, psm=7)
-            for w in data:
-                x,y,wid,hei = w["bbox"]
-                w["bbox"] = (x1+x, y1+y, wid, hei)
-            wordsB.extend(data)
+        y1 = top_off + r * tile_h + int(tile_h * bs_frac)
+        y2 = top_off + (r + 1) * tile_h - int(tile_h * pad_b)
+        y1 = max(top_off, min(H - 2, y1))
+        y2 = max(y1 + 4, min(H, y2))
+        # use full width here; we will map to refined grid later
+        roi = gray[y1:y2, :]
+        if roi.size == 0:
+            continue
+        data = _tess_data(roi, psm=7)  # single line is best for nameplates
+        for w in data:
+            x, y, wid, hei = w["bbox"]
+            w["bbox"] = (x, y1 + y, wid, hei)
+        wordsB.extend(data)
 
-    # Merge + filter
-    words_all = wordsA + wordsB
+    # ---------------- Pass C: INITIALS in center of each tile ----------------
+    wordsC = []
+    for r in range(3):
+        for c in range(3):
+            cx1 = int(c * tile_w_tmp + 0.25 * tile_w_tmp)
+            cy1 = int(top_off + r * tile_h + 0.25 * tile_h)
+            cx2 = int((c + 1) * tile_w_tmp - 0.25 * tile_w_tmp)
+            cy2 = int(top_off + (r + 1) * tile_h - 0.25 * tile_h)
+            cx1 = max(0, min(W-2, cx1)); cx2 = max(cx1+4, min(W, cx2))
+            cy1 = max(top_off, min(H-2, cy1)); cy2 = max(cy1+4, min(H, cy2))
+            roi = gray[cy1:cy2, cx1:cx2]
+            if roi.size == 0:
+                continue
+            data = _tess_data(roi, psm=8)  # single word
+            for w in data:
+                x, y, wid, hei = w["bbox"]
+                w["bbox"] = (cx1 + x, cy1 + y, wid, hei)
+            wordsC.extend(data)
+
+    # Merge & base filter
+    words_all = wordsA + wordsB + wordsC
     words_keep = [w for w in words_all if w["conf"] >= CONFIG["OCR_WORD_CONF_MIN"] and _clean_text(w["text"])]
-    # Debug overlay
+
+    # Hard filter: token center must be within the grid (avoid header/toolbar)
+    def _cy(bb):
+        x, y, w, h = bb
+        return y + h / 2.0
+    grid_min_y = top_off + 0.05 * tile_h
+    words_keep = [w for w in words_keep if _cy(w["bbox"]) >= grid_min_y]
+
+    # ================== NEW: infer 3×3 grid via 1-D k-means ==================
+    # prefer nameplate tokens (bottom strip)
+    def token_in_bottom_strip(w):
+        x, y, ww, hh = w["bbox"]
+        cy = y + hh / 2.0
+        return cy >= top_off + tile_h * bs_frac
+
+    bottom_tokens = [w for w in words_keep if token_in_bottom_strip(w)]
+    use_tokens = bottom_tokens if bottom_tokens else words_keep
+
+    # collect centers
+    xcenters = [w["bbox"][0] + w["bbox"][2] / 2.0 for w in use_tokens]
+    ycenters = [w["bbox"][1] + w["bbox"][3] / 2.0 for w in use_tokens]
+
+    col_cent = _kmeans1d(xcenters, k=3) or [W*0.17, W*0.50, W*0.83]
+    row_cent = _kmeans1d(ycenters, k=3) or [top_off + grid_h*0.17, top_off + grid_h*0.50, top_off + grid_h*0.83]
+
+    # turn centers into boundaries
+    cL, cM1, cM2, cR = _bounds_from_centers(col_cent, 0, W)
+    rT, rM1, rM2, rB = _bounds_from_centers(row_cent, top_off, H)
+
+    # If the inferred width is implausibly small, fall back to full width.
+    if (cR - cL) / max(1.0, W) < float(CONFIG.get("MIN_GRID_WIDTH_FRAC", 0.62)):
+        cL, cM1, cM2, cR = 0, W // 3, 2 * W // 3, W
+
+    # optional margin
+    margin = int(float(CONFIG.get("LR_MARGIN_FRAC", 0.02)) * W)
+    cL = max(0, cL - margin); cR = min(W, cR + margin)
+
+    # final grid bounds
+    col_bounds = [cL, cM1, cM2, cR]
+    row_bounds = [rT, rM1, rM2, rB]
+    print(f"[GRID] 3x3 from kmeans: cols={col_bounds} rows={row_bounds}")
+
+    # mapping helpers that respect these bounds
+    inset = int(CONFIG.get("GRID_INSET", 6))
+    def _which_bin(val: float, edges: List[int]) -> int:
+        # edges length 4 → returns 0,1,2
+        if val < edges[1]: return 0
+        if val < edges[2]: return 1
+        return 2
+
+    def _tile_bbox_from_point_grid(cx, cy):
+        col = _which_bin(cx, col_bounds)
+        row = _which_bin(cy, row_bounds)
+        x1, x2 = col_bounds[col], col_bounds[col + 1]
+        y1, y2 = row_bounds[row], row_bounds[row + 1]
+        bx, by = x1 + inset, y1 + inset
+        bw, bh = max(1, (x2 - x1) - 2*inset), max(1, (y2 - y1) - 2*inset)
+        return (bx, by, bw, bh), (row, col)
+
+    def _tile_bbox_from_bbox_grid(bb):
+        x, y, w, h = bb
+        return _tile_bbox_from_point_grid(x + w/2.0, y + h/2.0)
+
+    # Debug overlay of OCR tokens + detected grid box
     dbg = img.copy()
     for w in words_keep:
-        x,y,ww,hh = w["bbox"]
-        cv2.rectangle(dbg, (x,y), (x+ww,y+hh), (0,255,255), 1)
+        x, y, ww, hh = w["bbox"]
+        cv2.rectangle(dbg, (x, y), (x + ww, y + hh), (0, 255, 255), 1)
+    # draw detected grid bounds in magenta
+    cv2.rectangle(dbg, (grid_left, top_off), (grid_right, H), (255, 0, 255), 2)
     cv2.imwrite(str(outdir / "ocr_tokens_v2.png"), dbg)
-    print(f"[OCRDBG] Tokens (merged) conf>={CONFIG['OCR_WORD_CONF_MIN']}: {len(words_keep)}")
+    print(f"[OCRDBG] Tokens (grid) conf>={CONFIG['OCR_WORD_CONF_MIN']}: {len(words_keep)} | grid_left/right=({grid_left},{grid_right})")
 
     name_to_company = attendees_name_to_company
     attendee_names = list(name_to_company.keys())
 
-    kept_tiles: Dict[str, Tuple[int,int,int,int]] = {}
+    kept_tiles: Dict[str, Tuple[int, int, int, int]] = {}
     kept_score: Dict[str, float] = {}
 
-    # Initials-first (global) + large-bubble heuristic
-    init_hits = 0; init_seen = 0
+    # ---------------- Initials-first + large-bubble heuristic ----------------
+    init_hits = 0
+    init_seen = 0
     for w in words_keep:
         t = _clean_text(w["text"]).upper()
         if re.fullmatch(r"[A-Z]{2}", t):
             init_seen += 1
-            # cell bbox to estimate area
-            tile_bb, _ = _tile_bbox_from_bbox(w["bbox"], W, H, top_off)
+            tile_bb, _ = _tile_bbox_from_bbox_grid(w["bbox"])
             cell_area = tile_bb[2] * tile_bb[3]
             token_area = w["bbox"][2] * w["bbox"][3]
             large_bubble = token_area >= CONFIG["LARGE_BUBBLE_AREA_FRAC"] * cell_area
-            conf_ok = (w["conf"] >= CONFIG["INITIALS_CONF_MIN"])
+            conf_ok = w["conf"] >= CONFIG["INITIALS_CONF_MIN"]
             if conf_ok or large_bubble:
                 names = initials_map.get(t, [])
                 if len(names) == 1:
                     name = names[0]
                     score = max(w["conf"], 80.0 if large_bubble else w["conf"])
                     if score > kept_score.get(name, -1):
-                        kept_tiles[name] = tile_bb; kept_score[name] = score
+                        kept_tiles[name] = tile_bb
+                        kept_score[name] = score
                         init_hits += 1
     print(f"[OCRDBG] Initials tokens seen={init_seen} mapped_unique={init_hits}")
 
-    # Phrase assembly per cell bottom (1..5)
-    def token_in_bottom_strip(w):
-        x,y,ww,hh = w["bbox"]
-        cy = y + hh/2
-        return cy >= top_off + tile_h*0.70
+    # ---------------- Phrase assembly (bottom strips) ----------------
+    def token_in_bottom_strip_for_lines(w):
+        x, y, ww, hh = w["bbox"]
+        cy = y + hh / 2.0
+        return cy >= top_off + tile_h * bs_frac
 
-    cell_words = [w for w in words_keep if token_in_bottom_strip(w)]
+    cell_words = [w for w in words_keep if token_in_bottom_strip_for_lines(w)]
     cell_words.sort(key=lambda z: (z["bbox"][1], z["bbox"][0]))
 
-    lines: List[List[Dict[str,Any]]] = []
+    lines: List[List[Dict[str, Any]]] = []
     for w in cell_words:
-        if not lines: lines.append([w]); continue
-        last_y = sum([ww["bbox"][1] for ww in lines[-1]])/len(lines[-1])
-        if abs(w["bbox"][1]-last_y) <= 22:
+        if not lines:
+            lines.append([w])
+            continue
+        last_y = sum([ww["bbox"][1] for ww in lines[-1]]) / len(lines[-1])
+        if abs(w["bbox"][1] - last_y) <= 22:
             lines[-1].append(w)
         else:
             lines.append([w])
@@ -484,24 +616,25 @@ def ocr_to_tiles(screenshot_path: Path, attendees_name_to_company: Dict[str,str]
             bb = _union_bbox(bb, t["bbox"])
         return bb
 
-    phrase_attempts = 0; phrase_hits = 0
+    phrase_attempts = 0
+    phrase_hits = 0
     for line in lines:
         line.sort(key=lambda z: z["bbox"][0])
         n = len(line)
         for i in range(n):
-            for L in (1,2,3,4,5):
-                if i+L>n: break
-                toks = line[i:i+L]
+            for L in range(1, 8):  # up to 7 tokens
+                if i + L > n: break
+                toks = line[i:i + L]
                 phrase_attempts += 1
                 text = " ".join([_clean_text(tt["text"]) for tt in toks])
                 if not text: continue
                 text = _strip_badges(text)
                 bb = union_bbox_chain(toks)
 
-                # Email → name
-                email_match = re.search(r"[A-Za-z0-9._%+-]+@([A-Za-z0-9.-]+)", text)
-                if email_match:
-                    email = email_match.group(0).lower()
+                # Email → name (with fuzzy local-part rescue)
+                m = re.search(r"[A-Za-z0-9._%+-]+@([A-Za-z0-9.-]+)", text)
+                if m:
+                    email = m.group(0).lower()
                     name = email_to_name.get(email)
                     if not name and attendee_names:
                         local = email.split("@")[0]
@@ -509,37 +642,73 @@ def ocr_to_tiles(screenshot_path: Path, attendees_name_to_company: Dict[str,str]
                         if best and best[1] >= CONFIG["FUZZ_MIN_SCORE"]:
                             name = best[0]
                     if name:
-                        tile_bb, _ = _tile_bbox_from_bbox(bb, W, H, top_off)
+                        tile_bb, _ = _tile_bbox_from_bbox_grid(bb)
                         score = 85.0
                         if score > kept_score.get(name, -1):
-                            kept_tiles[name] = tile_bb; kept_score[name] = score
+                            kept_tiles[name] = tile_bb
+                            kept_score[name] = score
                             phrase_hits += 1
                         continue
 
-                # Fuzzy full-name
+                # Fuzzy full-name (normalized)
                 if attendee_names:
-                    best = rf_process.extractOne(text, attendee_names, scorer=fuzz.WRatio)
+                    cand = _normalize_label_for_match(text)
+                    best = rf_process.extractOne(cand, attendee_names, scorer=fuzz.WRatio)
                     if best and best[1] >= CONFIG["FUZZ_MIN_SCORE"]:
-                        name = best[0]; score = best[1]
-                        tile_bb, _ = _tile_bbox_from_bbox(bb, W, H, top_off)
+                        name = best[0]
+                        score = best[1]
+                        tile_bb, _ = _tile_bbox_from_bbox_grid(bb)
                         if score > kept_score.get(name, -1):
-                            kept_tiles[name] = tile_bb; kept_score[name] = score
+                            kept_tiles[name] = tile_bb
+                            kept_score[name] = score
                             phrase_hits += 1
 
     print(f"[OCRDBG] Phrase attempts={phrase_attempts} accepted={phrase_hits}")
 
-    kept = [(name, kept_tiles[name]) for name in kept_tiles.keys()]
-    # overlay
+    # --- COLLAPSE: keep one best candidate per (row, col) cell ---
+    # Prefer the grid-aware mapper if present; otherwise fall back to the older 3x3-from-top_off mapper.
+    _map_bbox = globals().get("_tile_bbox_from_bbox_grid", None)
+    if _map_bbox is None:
+        def _map_bbox(bb):
+            return _tile_bbox_from_bbox(bb, W, H, top_off)
+
+    by_cell = {}
+    for name, bb in kept_tiles.items():
+        _, rc = _map_bbox(bb)  # rc = (row, col)
+        key = (int(rc[0]), int(rc[1]))
+        score = float(kept_score.get(name, 0.0))
+        if key not in by_cell or score > by_cell[key][1]:
+            by_cell[key] = ((name, bb), score)
+
+    kept = [by_cell[k][0] for k in sorted(by_cell.keys())]
+
+    # ---------------- Debug overlay: draw inferred grid (magenta) + kept tiles (green) ----------------
     overlay = img.copy()
+
+    # Use k-means grid bounds if they exist; otherwise fall back to equal thirds.
+    col_bounds = locals().get("col_bounds", [0, W // 3, 2 * W // 3, W])
+    row_bounds = locals().get("row_bounds", [top_off, top_off + tile_h, top_off + 2 * tile_h, H])
+
+    # Draw grid lines (magenta)
+    for x in map(int, col_bounds):
+        cv2.line(overlay, (x, int(row_bounds[0])), (x, int(row_bounds[-1])), (255, 0, 255), 2)
+    for y in map(int, row_bounds):
+        cv2.line(overlay, (int(col_bounds[0]), y), (int(col_bounds[-1]), y), (255, 0, 255), 2)
+
+    # Draw the kept attendee tiles (green)
     for name, bb in kept:
-        x,y,w,h = bb
-        cv2.rectangle(overlay, (x,y), (x+w,y+h), (0,255,0), 2)
-        cv2.putText(overlay, name[:20], (x+8,y+24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 1, cv2.LINE_AA)
+        x, y, w, h = bb
+        cv2.rectangle(overlay, (x, y), (x + w, y + h), (0, 255, 0), 2)
+        cv2.putText(
+            overlay, name[:20], (x + 8, y + 24),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1, cv2.LINE_AA
+        )
+
     out_tiles = outdir / "tiles_from_tokens_v2.png"
     cv2.imwrite(str(out_tiles), overlay)
     print(f"[OCRDBG] Kept attendees as tiles: {len(kept)} -> {out_tiles}")
 
-    return kept, (W,H), top_off
+    return kept, (W, H), top_off
 
 # ----------------------------- Blue Border Detection -----------------------------
 def detect_blue_border_regions(frame: "np.ndarray") -> Tuple[List[Tuple[int,int,int,int]], "np.ndarray"]:
