@@ -44,54 +44,56 @@ CONFIG = {
     "FPS_SAMPLE": 3.0,
     "VIDEO_WORKERS": 4,
 
-    # Blue border HSV (Teams blue)
-    "LOWER_HSV": (95, 70, 70),
-    "UPPER_HSV": (135, 255, 255),
-
+    # Blue border (robust)
+    "LOWER_HSV": (85, 50, 50),
+    "UPPER_HSV": (140, 255, 255),
     "MIN_BOX_W": 30,
     "MIN_BOX_H": 30,
     "MIN_AREA": 150,
-    "MAX_STROKE_RATIO": 0.30,
+    "MAX_STROKE_RATIO": 0.45,
 
-    "VIDEO_CROP": None,           # (x,y,w,h) or None
+    "VIDEO_CROP": None,
 
     "TESSERACT_CMD": None,
 
     "DEBUG": True,
     "DEBUG_EVERY_N": 15,
 
-    # OCR tuning
+    # OCR tuning (robust)
     "OCR_LANG": "eng",
     "OCR_ALLOWED_RE": r"[^A-Za-z0-9 .,'()@\-\[\]]",
     "OCR_MIN_LEN": 2,
-    "FUZZ_MIN_SCORE": 55,         # relaxed
-    "OCR_WORD_CONF_MIN": 50,
-    "INITIALS_CONF_MIN": 50,      # relaxed
-    "WORDS_Y_MIN_FRAC": 0.35,
+    "FUZZ_MIN_SCORE": 55,
+    "OCR_WORD_CONF_MIN": 40,
+    "INITIALS_CONF_MIN": 40,
+    # make the bottom label band a hair taller and keep a small bottom margin
+    "BOTTOM_STRIP_FRAC": 0.58,            # was 0.62; 0.56–0.60 is a good range
+    "BOTTOM_STRIP_PAD_BOTTOM_FRAC": 0.015, # cut ~1.5% of tile height from the bottom (prevents cropping UI border)
+    "AUTO_LR_FROM_TOKENS": True,   # enable auto left/right grid bounds
+    "LR_MARGIN_FRAC": 0.02,      # a touch more margin
+    "MIN_GRID_WIDTH_FRAC": 0.62, # allow narrower inferred grids
+    "AUTO_LR_OFFSET": True,      # infer horizontal grid bounds from tokens
+    "AUTO_LR_PAD_FRAC": 0.02,    # widen inferred L/R by this fraction of W (for safety)
 
-<<<<<<< Updated upstream
-    # Grid geometry
-=======
     # Grid geometry (static screenshot path)
->>>>>>> Stashed changes
     "TOP_OFFSET_FRAC": 0.09,
     "AUTO_TOP_OFFSET": True,
+    "AUTO_TOP_MIN_FRAC": 0.10,           # new
+    "AUTO_TOP_MAX_FRAC": 0.20,           # new
+    "AUTO_TOP_EXTRA_FRAC": 0.03,         # new
     "GRID_INSET": 6,
 
-    # Large-bubble initials heuristic
-    "LARGE_BUBBLE_AREA_FRAC": 0.035,  # ~3.5% of cell area
-<<<<<<< Updated upstream
-=======
+    # Large-bubble initials heuristic (robust)
+    "LARGE_BUBBLE_AREA_FRAC": 0.02,
 
     # ===================== [V2_9] Dynamic grid config =====================
-    "DYNAMIC_GRID": False,                # enable per-frame dynamic grid detection
-    "DYNAMIC_MAX_SIDE": 4,               # up to 4x4
-    "ONFRAME_OCR": True,                 # OCR within a tile's bottom strip to read the name
+    "DYNAMIC_GRID": False,
+    "DYNAMIC_MAX_SIDE": 4,
+    "ONFRAME_OCR": True,
     "TRANSCRIPT_ONLY_PLACEHOLDER": "UnknownSpeaker",
-    "FALLBACK_IF_NO_SCREENSHOT": True,   # if no screenshot or no OCR tiles, switch to dynamic or transcript-only
+    "FALLBACK_IF_NO_SCREENSHOT": True,
     "EXPORT_DYNAMIC_MAP": True,
-    "DYNAMIC_NAME_CACHE_TTL": 150,       # frames to keep a name before expiring
->>>>>>> Stashed changes
+    "DYNAMIC_NAME_CACHE_TTL": 150,
 }
 
 # ============================ Imports ============================
