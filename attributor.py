@@ -777,11 +777,22 @@ def apply_vocab_rules(text: str) -> str:
     return out
 
 def map_tile_to_attendee_name(tile_name: str, attendees: Dict[str, str]) -> str:
-    if not attendees: return tile_name
+    """
+    [V2_9_2] Avoid collapsing different people with the same short label.
+    If the tile text is generic (single token or very short), require higher confidence.
+    """
+    if not attendees:
+        return tile_name
     choices = list(attendees.keys())
-    if not choices: return tile_name
+    if not choices:
+        return tile_name
+
+    generic = len(tile_name.split()) <= 1 or len(tile_name) <= 6
+    thresh = 80 if generic else 70
+
     best = rf_process.extractOne(tile_name, choices, scorer=fuzz.WRatio)
-    if best and best[1] >= 70: return best[0]
+    if best and best[1] >= thresh:
+        return best[0]
     return tile_name
 
 def overlap(a, b):
@@ -811,11 +822,6 @@ def attribute_segments(segments: List[Dict], timeline: List[SpeakerEvent], atten
             out.append(TranscriptSegment(start=s_start, end=s_end, text=s_text, speaker=None, validated=False, prob=s_prob))
     return out
 
-<<<<<<< Updated upstream
-# ----------------------------- Orchestrator -----------------------------
-def build_active_speaker_timeline(video_path: Path, tiles: List[Tile], fps: float,
-                                  video_workers: int, debug_dir: Optional[Path]) -> List[SpeakerEvent]:
-=======
 def attribute_segments_transcript_only(segments: List[Dict], placeholder: str) -> List['TranscriptSegment']:
     # [V2_9] transcript-only mode: single placeholder speaker, no validation
     out: List[TranscriptSegment] = []
@@ -866,12 +872,14 @@ class DynamicGridAttributor:
                        initials_map: Dict[str, List[str]]) -> Optional[str]:
         if not CONFIG["ONFRAME_OCR"]:
             return None
-        # OCR only bottom strip of the tile to catch the overlay name
+        # OCR only the bottom strip where the overlay name lives
         h, w = tile_img.shape[:2]
-        y1 = int(h * 0.70); y2 = max(y1+5, h-2)
+        frac = float(CONFIG.get("BOTTOM_STRIP_FRAC", 0.62))
+        y1 = int(h * frac)
+        y2 = max(y1 + 5, h - 2)
         roi = _preproc_gray(tile_img[y1:y2, :])
         toks = _tess_data(roi, psm=7)
-        # Convert bbox to tile coordinates (for consistency unused here)
+
         texts = [t for t in toks if t["conf"] >= CONFIG["OCR_WORD_CONF_MIN"] and t["text"]]
         if not texts:
             return None
@@ -880,11 +888,14 @@ class DynamicGridAttributor:
         line = _strip_badges(line)
         if not line:
             return None
-        # Direct fuzzy to attendees
+
+        # Direct fuzzy to attendees (normalized)
         if attendees:
-            best = rf_process.extractOne(line, list(attendees.keys()), scorer=fuzz.WRatio)
+            cand = _normalize_label_for_match(line)
+            best = rf_process.extractOne(cand, list(attendees.keys()), scorer=fuzz.WRatio)
             if best and best[1] >= CONFIG["FUZZ_MIN_SCORE"]:
                 return best[0]
+
         # Initials-only fallthrough: pick any 2-letter token and map
         for t in texts:
             token = _clean_text(t["text"]).upper()
@@ -901,55 +912,65 @@ class DynamicGridAttributor:
         self.speaker_map[tid]["last_seen"] = self.frame_count
 
     def prune_stale(self, ttl: int):
-        doomed = [tid for tid, meta in self.speaker_map.items() if (self.frame_count - meta.get("last_seen", -1)) > ttl]
+        doomed = [tid for tid, meta in self.speaker_map.items()
+                  if (self.frame_count - meta.get("last_seen", -1)) > ttl]
         for tid in doomed:
             self.speaker_map.pop(tid, None)
 
 # ----------------------------- Orchestrator -----------------------------
-def build_active_speaker_timeline(video_path: Path, tiles: List[Tile], fps: float,
-                                  video_workers: int, debug_dir: Optional[Path],
-                                  dynamic_mode: bool = False,
-                                  attendees: Optional[Dict[str,str]] = None,
-                                  initials_map: Optional[Dict[str, List[str]]] = None,
-                                  dynamic_export_path: Optional[Path] = None) -> Tuple[List[SpeakerEvent], Optional[DynamicGridAttributor]]:
+def build_active_speaker_timeline(
+    video_path: Path,
+    tiles: List[Tile],
+    fps: float,
+    video_workers: int,
+    debug_dir: Optional[Path],
+    dynamic_mode: bool = False,
+    attendees: Optional[Dict[str, str]] = None,
+    initials_map: Optional[Dict[str, List[str]]] = None,
+    dynamic_export_path: Optional[Path] = None
+) -> Tuple[List[SpeakerEvent], Optional[DynamicGridAttributor]]:
     """
     Build active-speaker timeline.
     - Static mode: use fixed tiles from screenshot (previous behavior).
     - Dynamic mode [V2_9]: detect grid per frame and map blue-border boxes to that grid.
     Returns timeline and optional DynamicGridAttributor (for exporting a map).
     """
->>>>>>> Stashed changes
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened(): raise RuntimeError(f"Failed to open video: {video_path}")
+    if not cap.isOpened():
+        raise RuntimeError(f"Failed to open video: {video_path}")
     native_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
 
     crop = CONFIG["VIDEO_CROP"]
+
     def crop_frame(f):
-        if not crop: return f
-        x,y,w,h = crop
-        return f[y:y+h, x:x+w]
+        if not crop:
+            return f
+        x, y, w, h = crop
+        return f[y:y + h, x:x + w]
 
     step = int(max(1, round(native_fps / max(0.1, fps))))
     idx = 0
     jobs = []
-<<<<<<< Updated upstream
-=======
-    dyn = DynamicGridAttributor(rows_max=CONFIG["DYNAMIC_MAX_SIDE"], verbose=bool(CONFIG["DEBUG"])) if dynamic_mode else None
+    dyn = DynamicGridAttributor(
+        rows_max=CONFIG["DYNAMIC_MAX_SIDE"],
+        verbose=bool(CONFIG["DEBUG"])
+    ) if dynamic_mode else None
 
     def _detect_one_frame(ts: float, frame):
         boxes, mask = detect_blue_border_regions(frame)
         return ts, boxes, frame if CONFIG["DEBUG"] else None, mask if CONFIG["DEBUG"] else None, frame
 
->>>>>>> Stashed changes
     with ThreadPoolExecutor(max_workers=max(1, video_workers)) as ex:
         while True:
             ret = cap.grab()
-            if not ret: break
+            if not ret:
+                break
             if idx % step == 0:
                 ret, frame = cap.retrieve()
-                if not ret or frame is None: break
+                if not ret or frame is None:
+                    break
                 ts = idx / native_fps
                 frame = crop_frame(frame)
                 jobs.append(ex.submit(_detect_one_frame, ts, frame))
