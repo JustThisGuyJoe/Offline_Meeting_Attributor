@@ -1,52 +1,61 @@
 #!/usr/bin/env python3
 """
-attributor.py  (V3)
+Attributor V3.1
+================
 
-Purpose (roll-up from prior project specs with targeted V3 changes)
-------------------------------------------------------------------
-Offline Teams/Zoom-style meeting attribution with:
-- .ics attendee parsing (names, emails → normalized names/companies)
-- OCR on screenshot(s) for tile/name mapping (bottom-label emphasis, initials heuristic)
-- Dynamic OR static grid attribution of active speaker via BLUE BORDER detection
-- Corrected VTT (+ "*" for visually validated), JSON artifacts, and QA report
-- GPU-first STT fallback (only when transcript is absent)
+Purpose
+-------
+Roll-up of V3 with fixes for your curved-screen capture + dynamic layouts:
 
-V3 DELTAS (applied from the "710-line roll-up" guidance)
---------------------------------------------------------
-1) Mask-per-tile scoring (NOT contour IoU):
-   - We compute a blue HSV mask and SUM the mask pixels INSIDE each grid tile.
-   - Pick the max-scoring tile per frame with a frame-area-relative floor.
+1) Perspective pre-warp (optional):
+   - CONFIG["WARP_QUAD"] = four (x,y) points on the video that bracket the Teams canvas
+   - CONFIG["WARP_SIZE"] = (width, height) of the rectified output (e.g., (1280,720))
+   - Each video frame is rectified before detection/scoring.
 
-2) Resolution-agnostic thresholds:
-   - Use MIN_EDGE_AREA_FRAC (fraction of full-frame area) instead of fixed pixel MIN_AREA/MIN_BOX_*.
+2) Dynamic layout estimator from nameplates (robust to participants joining/leaving):
+   - Samples the bottom-band OCR across the *video frame* every N frames
+   - Infers column/row centers via 1-D k-means (k chosen automatically in [2..DYNAMIC_MAX_SIDE])
+   - Converts centers → grid bounds and slices tiles accordingly (no dependency on an external screenshot).
 
-3) Hue relax toggle:
-   - Optional RELAXED_BLUE_THRESHOLD (e.g., 0.35) widens the HSV hue window for pale/pastel borders.
-   - Exposed via CLI --relaxed-blue-threshold, or set in CONFIG.
+3) Safer defaults for screenshot OCR (when used only for names):
+   - Avoids left-shifted grid by disabling token-based L/R and clamping width to ~full width
+   - Slightly taller bottom label band; smaller inset
 
-4) Segment voting across frames:
-   - When assigning transcript segments to speakers, vote by accumulated active duration
-     within a small padded time window for stability (kills flicker).
+4) Keep V3 scoring: sums blue-mask pixels *inside each tile* (resolution-agnostic)
+   - Optional hue relax for pastel borders (--relaxed-blue-threshold)
 
-Other behavior is unchanged from your V2_9: dynamic grid helper, on-frame OCR for tile names,
-extended .ics parsing, vocab normalization, and robust OCR heuristics.
+5) Optional convenience flag: --tiles-from-video
+   - Grabs a representative frame from the video and uses it for OCR-to-names.
 
-Run
----
-    python attributor.py --interactive
-    # or with flags:
-    python attributor.py --video meeting.mp4 --screenshot grid.png --ics invite.ics --outdir out --dynamic-grid --relaxed-blue-threshold 0.35
+Run examples
+------------
+Dynamic + warp + relaxed blue:
+    python attributor_v3_1.py \
+        --video meeting.mp4 \
+        --ics invite.ics \
+        --outdir out \
+        --dynamic-grid \
+        --relaxed-blue-threshold 0.35
+
+If you want names from a frame in the video (no external screenshot):
+    python attributor_v3_1.py \
+        --video meeting.mp4 --tiles-from-video \
+        --ics invite.ics --outdir out --dynamic-grid --relaxed-blue-threshold 0.35
+
+To set a perspective warp, edit CONFIG["WARP_QUAD"] and CONFIG["WARP_SIZE"].
+Pick the *inner* corners of the Teams canvas in the recorded video.
+
 """
 
 from __future__ import annotations
-import argparse, dataclasses, json, os, re, subprocess, sys, math, glob
+import argparse, dataclasses, json, os, re, subprocess
 from dataclasses import dataclass
-from datetime import timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 
 # ============================== CONFIG ==============================
 CONFIG = {
+    # STT
     "LANGUAGE": "en",
     "PREFER_FASTER": True,
     "STT_MODEL": "medium",
