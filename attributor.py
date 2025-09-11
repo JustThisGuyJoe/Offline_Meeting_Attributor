@@ -756,7 +756,7 @@ class DynamicGridAttributor:
             print(f"[DynGrid] {msg}")
 
     def detect_grid_size(self, frame: np.ndarray) -> Tuple[int, int]:
-        # Guess grid size based on simple heuristics (square-ish tiles).
+        # Simple heuristic: assume near-square tiles; bound by rows_max
         h, w = frame.shape[:2]
         approx_tile = max(1, min(h, w) // self.rows_max)
         rows = max(1, min(self.rows_max, h // max(1, approx_tile)))
@@ -780,9 +780,8 @@ class DynamicGridAttributor:
                        initials_map: Dict[str, List[str]]) -> Optional[str]:
         if not CONFIG["ONFRAME_OCR"]:
             return None
-        # OCR only the bottom strip where the overlay name lives
         h, w = tile_img.shape[:2]
-        frac = float(CONFIG.get("BOTTOM_STRIP_FRAC", 0.62))
+        frac = float(CONFIG.get("BOTTOM_STRIP_FRAC", 0.58))
         y1 = int(h * frac)
         y2 = max(y1 + 5, h - 2)
         roi = _preproc_gray(tile_img[y1:y2, :])
@@ -797,14 +796,12 @@ class DynamicGridAttributor:
         if not line:
             return None
 
-        # Direct fuzzy to attendees (normalized)
         if attendees:
             cand = _normalize_label_for_match(line)
             best = rf_process.extractOne(cand, list(attendees.keys()), scorer=fuzz.WRatio)
             if best and best[1] >= CONFIG["FUZZ_MIN_SCORE"]:
                 return best[0]
 
-        # Initials-only fallthrough: pick any 2-letter token and map
         for t in texts:
             token = _clean_text(t["text"]).upper()
             if re.fullmatch(r"[A-Z]{2}", token):
