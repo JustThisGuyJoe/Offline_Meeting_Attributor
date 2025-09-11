@@ -745,10 +745,6 @@ def attribute_segments_transcript_only(segments: List[Dict], placeholder: str) -
 
 # ----------------------------- [V2_9] Dynamic Grid Helper -----------------------------
 class DynamicGridAttributor:
-    """
-    [V2_9] Heuristic dynamic grid detection and name resolution.
-    Maintains a lightweight speaker map: {tile_id -> {"name": str, "last_seen": int}}.
-    """
     def __init__(self, rows_max: int = 4, verbose: bool = True):
         self.rows_max = max(1, rows_max)
         self.verbose = verbose
