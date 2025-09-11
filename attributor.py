@@ -712,22 +712,30 @@ def attribute_segments(segments: List[Dict], timeline: List[SpeakerEvent], atten
     for seg in segments:
         s_start, s_end, s_text = float(seg["start"]), float(seg["end"]), apply_vocab_rules(seg["text"])
         s_prob = seg.get("prob", None)
-        chosen = None
-        while i < len(events) and events[i].end < s_start: i += 1
-        j = i; best_overlap = 0.0
-        while j < len(events) and events[j].start <= s_end:
-            ov = overlap((s_start, s_end), (events[j].start, events[j].end))
-            if ov > best_overlap: best_overlap = ov; chosen = events[j]
+
+        # gather candidates with small temporal pad
+        pad = 0.25
+        # advance pointer
+        while i < len(events) and events[i].end < s_start - pad: i += 1
+        j = i; counts: Dict[str, float] = {}
+        while j < len(events) and events[j].start <= s_end + pad:
+            ev = events[j]
+            dur = overlap((s_start - pad, s_end + pad), (ev.start, ev.end))
+            if dur > 0:
+                counts[ev.tile_name] = counts.get(ev.tile_name, 0.0) + dur
             j += 1
-        if chosen:
-            mapped = map_tile_to_attendee_name(chosen.tile_name, attendees)
-            out.append(TranscriptSegment(start=s_start, end=s_end, text=s_text, speaker=mapped, validated=chosen.validated, prob=s_prob))
-        else:
+
+        if not counts:
             out.append(TranscriptSegment(start=s_start, end=s_end, text=s_text, speaker=None, validated=False, prob=s_prob))
+            continue
+
+        chosen_name = max(counts.items(), key=lambda kv: kv[1])[0]
+        mapped = map_tile_to_attendee_name(chosen_name, attendees)
+        out.append(TranscriptSegment(start=s_start, end=s_end, text=s_text, speaker=mapped, validated=True, prob=s_prob))
+
     return out
 
 def attribute_segments_transcript_only(segments: List[Dict], placeholder: str) -> List['TranscriptSegment']:
-    # [V2_9] transcript-only mode: single placeholder speaker, no validation
     out: List[TranscriptSegment] = []
     for seg in segments:
         s_start, s_end, s_text = float(seg["start"]), float(seg["end"]), apply_vocab_rules(seg["text"])
