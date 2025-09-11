@@ -520,28 +520,17 @@ def ocr_to_tiles(screenshot_path: Path, attendees_name_to_company: Dict[str,str]
                     if score > kept_score.get(name, -1):
                         kept_tiles[name] = tile_bb
                         kept_score[name] = score
-                        init_hits += 1
-    print(f"[OCRDBG] Initials tokens seen={init_seen} mapped_unique={init_hits}")
 
-    # ---------------- Phrase assembly (bottom strips) ----------------
-    def token_in_bottom_strip_for_lines(w):
-        x, y, ww, hh = w["bbox"]
-        cy = y + hh / 2.0
-        return cy >= top_off + tile_h * bs_frac
-
-    cell_words = [w for w in words_keep if token_in_bottom_strip_for_lines(w)]
+    # Phrase assembly on bottom strips (email → name → fuzzy full name)
+    # group by rows
+    cell_words = [w for w in words_keep if (w["bbox"][1] + w["bbox"][3]/2.0) >= top_off + tile_h * bs_frac]
     cell_words.sort(key=lambda z: (z["bbox"][1], z["bbox"][0]))
-
     lines: List[List[Dict[str, Any]]] = []
     for w in cell_words:
-        if not lines:
-            lines.append([w])
-            continue
+        if not lines: lines.append([w]); continue
         last_y = sum([ww["bbox"][1] for ww in lines[-1]]) / len(lines[-1])
-        if abs(w["bbox"][1] - last_y) <= 22:
-            lines[-1].append(w)
-        else:
-            lines.append([w])
+        if abs(w["bbox"][1] - last_y) <= 22: lines[-1].append(w)
+        else: lines.append([w])
 
     def union_bbox_chain(toks):
         bb = toks[0]["bbox"]
@@ -549,22 +538,19 @@ def ocr_to_tiles(screenshot_path: Path, attendees_name_to_company: Dict[str,str]
             bb = _union_bbox(bb, t["bbox"])
         return bb
 
-    phrase_attempts = 0
-    phrase_hits = 0
     for line in lines:
         line.sort(key=lambda z: z["bbox"][0])
         n = len(line)
         for i in range(n):
-            for L in range(1, 8):  # up to 7 tokens
+            for L in range(1, 8):
                 if i + L > n: break
-                toks = line[i:i + L]
-                phrase_attempts += 1
+                toks = line[i:i+L]
                 text = " ".join([_clean_text(tt["text"]) for tt in toks])
                 if not text: continue
                 text = _strip_badges(text)
                 bb = union_bbox_chain(toks)
 
-                # Email → name (with fuzzy local-part rescue)
+                # email → name
                 m = re.search(r"[A-Za-z0-9._%+-]+@([A-Za-z0-9.-]+)", text)
                 if m:
                     email = m.group(0).lower()
