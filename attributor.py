@@ -1054,7 +1054,7 @@ def write_qa_report(segments, timeline, out_path: Path):
     out_path.write_text(json.dumps(coverage, indent=2), encoding="utf-8")
     print("[REPORT]", json.dumps(coverage))
 
-# ----------------------------- Interactive -----------------------------
+# ----------------------------- Interactive I/O -----------------------------
 def _try_tk():
     try:
         import tkinter as _tk
@@ -1088,6 +1088,22 @@ def _prompt_path_gui(label: str, is_dir: bool = False, filetypes=None) -> Option
         return None
     return None
 
+def extract_frame_for_ocr(video_path: Path, outdir: Path, when_sec: float = 5.0) -> Optional[Path]:
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        return None
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    target_idx = int(max(0, round(when_sec * fps)))
+    cap.set(cv2.CAP_PROP_POS_FRAMES, target_idx)
+    ok, frame = cap.read()
+    cap.release()
+    if not ok or frame is None:
+        return None
+    frame = _maybe_warp(frame)
+    p = outdir / "frame_for_ocr.png"
+    cv2.imwrite(str(p), frame)
+    return p
+
 def prompt_paths_interactive(args) -> Tuple[Path, Optional[Path], Path, Path]:
     video = args.video if isinstance(args.video, Path) else None
     screenshot = args.screenshot if isinstance(args.screenshot, Path) else None
@@ -1098,7 +1114,7 @@ def prompt_paths_interactive(args) -> Tuple[Path, Optional[Path], Path, Path]:
         video = _prompt_path_gui("Select meeting video (mp4/mkv/etc.)",
                                  filetypes=[("Video", "*.mp4 *.mkv *.mov *.avi"), ("All", "*.*")]) \
                 or _prompt_path_console("Drop meeting video path")
-    if not screenshot:
+    if not screenshot and not args.tiles_from_video:
         screenshot = _prompt_path_gui("Select meeting grid screenshot (PNG/JPG) [optional]",
                                       filetypes=[("Images", "*.png *.jpg *.jpeg"), ("All", "*.*")])
         if not screenshot:
@@ -1119,17 +1135,18 @@ def prompt_paths_interactive(args) -> Tuple[Path, Optional[Path], Path, Path]:
 
 # ----------------------------- Main -----------------------------
 def main():
-    p = argparse.ArgumentParser(description="V3: mask-per-tile scoring + hue relax + segment voting")
+    p = argparse.ArgumentParser(description="V3.1: curved-screen warp + dynamic layout estimator + safer OCR grid")
     p.add_argument("--interactive", action="store_true")
     p.add_argument("--video", type=Path)
-    p.add_argument("--screenshot", type=Path)  # optional
+    p.add_argument("--screenshot", type=Path)
+    p.add_argument("--tiles-from-video", action="store_true", help="Grab a frame from the video and use it for OCR-to-names")
     p.add_argument("--ics", type=Path)
     p.add_argument("--outdir", type=Path)
-    p.add_argument("--dynamic-grid", action="store_true", help="Enable dynamic grid mode")
+    p.add_argument("--dynamic-grid", action="store_true", help="Enable dynamic grid mode (recommended for camera captures)")
     p.add_argument("--relaxed-blue-threshold", type=float, default=None, help="Widen HSV hue band by this factor (e.g., 0.35)")
     args = p.parse_args()
 
-    # Toggle dynamic grid via ENV, and set relax factor
+    # ENV toggles
     env_val = os.getenv("ATTRIB_DYNAMIC_GRID")
     if env_val is not None:
         CONFIG["DYNAMIC_GRID"] = env_val.strip().lower() in ("1", "true", "yes", "on")
@@ -1152,17 +1169,23 @@ def main():
     outdir: Path = args.outdir
     outdir.mkdir(parents=True, exist_ok=True)
 
-    # Parse ICS (extended)
+    # ICS
     name_to_company, email_to_name, initials_map = parse_ics_attendees_extended(args.ics)
     print(f"[ICS] Attendees parsed: {len(name_to_company)} names, {len(email_to_name)} emails")
 
+    # Screenshot → tiles (names only). Optionally extract from video.
+    shot_for_ocr = None
+    if args.tiles_from_video:
+        shot_for_ocr = extract_frame_for_ocr(args.video, outdir, when_sec=5.0)
+        if shot_for_ocr:
+            print(f"[OCR] Using frame for OCR: {shot_for_ocr}")
     tiles = []
     shot_size = None
 
-    # OCR → tiles (if screenshot provided)
-    if args.screenshot and Path(args.screenshot).exists():
+    screenshot_path = args.screenshot or shot_for_ocr
+    if screenshot_path and Path(screenshot_path).exists():
         try:
-            kept, shot_size, top_off = ocr_to_tiles(args.screenshot, name_to_company, email_to_name, initials_map, outdir=outdir)
+            kept, shot_size, _ = ocr_to_tiles(screenshot_path, name_to_company, email_to_name, initials_map, outdir=outdir)
             print(f"[OCR] Tiles from tokens: {len(kept)} | screenshot size={shot_size}")
             if kept[:9]:
                 print("     Sample:", [n for n,_ in kept[:9]])
@@ -1177,18 +1200,29 @@ def main():
     else:
         print("[OCR] No screenshot provided.")
 
-    # Video size
+    # Video size (after warp size if provided)
     cap_sz = cv2.VideoCapture(str(args.video))
     if not cap_sz.isOpened(): raise RuntimeError("Cannot open video to query size")
     vw = int(cap_sz.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
     vh = int(cap_sz.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
     cap_sz.release()
-    dst_size = (vw, vh) if not CONFIG["VIDEO_CROP"] else (CONFIG["VIDEO_CROP"][2], CONFIG["VIDEO_CROP"][3])
-    print(f"[VIDEO] size={vw}x{vh} | target grid size={dst_size} | crop={CONFIG['VIDEO_CROP']}")
+
+    if CONFIG.get("WARP_SIZE"):
+        dst_size = tuple(CONFIG["WARP_SIZE"])
+    else:
+        dst_size = (vw, vh) if not CONFIG["VIDEO_CROP"] else (CONFIG["VIDEO_CROP"][2], CONFIG["VIDEO_CROP"][3])
+    print(f"[VIDEO] size={vw}x{vh} | target grid size={dst_size} | crop={CONFIG['VIDEO_CROP']} | warp_size={CONFIG.get('WARP_SIZE')}")
 
     tiles_scaled = []
     if tiles and shot_size:
-        tiles_scaled = scale_tiles_to_frame(tiles, shot_size, dst_size)
+        # Note: tiles are only used for static mode; in dynamic mode we slice from the video
+        sw, sh = shot_size
+        dw, dh = dst_size
+        if sw and sh and dw and dh:
+            sx, sy = dw / sw, dh / sh
+            for t in tiles:
+                x, y, w, h = t.bbox
+                tiles_scaled.append(Tile(name=t.name, bbox=(int(round(x*sx)), int(round(y*sy)), int(round(w*sx)), int(round(h*sy))), grid_pos=t.grid_pos))
 
     # Audio → STT
     wav_path = outdir / "audio_16k.wav"
@@ -1235,7 +1269,7 @@ def main():
     write_qa_report(segments, timeline, qa_path)
 
     if len(timeline) == 0:
-        print("[DIAG] No blue-border events. Try adjusting HSV or --relaxed-blue-threshold, or set VIDEO_CROP.")
+        print("[DIAG] No blue-border events. Try adjusting HSV or --relaxed-blue-threshold, or set VIDEO_CROP / WARP_QUAD.")
 
     print(json.dumps({
         "status": "ok",
