@@ -355,52 +355,24 @@ def _tess_data(img, psm: int) -> List[Dict[str, Any]]:
     return out
 
 def _auto_top_offset(gray: np.ndarray) -> int:
-    """
-    [V2_9_1] Robustly pick the top of the grid (exclude window chrome).
-    - Smooth row energy to avoid picking icon clusters in the top bar.
-    - Add a small downward bias.
-    - Clamp to a safe band [AUTO_TOP_MIN_FRAC..AUTO_TOP_MAX_FRAC] of H.
-    """
     if not CONFIG["AUTO_TOP_OFFSET"]:
         return int(CONFIG["TOP_OFFSET_FRAC"] * gray.shape[0])
-
     H = gray.shape[0]
-    # Edge energy per row
     gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
     gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
     mag = cv2.magnitude(gx, gy)
     row_energy = mag.mean(axis=1)
-
     search_to = int(0.25 * H)
     if search_to < 10:
         return int(CONFIG["TOP_OFFSET_FRAC"] * H)
-
-    # Smooth to avoid spurious icon peaks
-    k = max(3, (int(0.01 * H) | 1))  # odd
+    k = max(3, (int(0.01 * H) | 1))
     row_energy_s = cv2.GaussianBlur(row_energy.astype(np.float32), (k, 1), 0)
-
     idx = int(np.argmax(row_energy_s[:search_to]))
     extra = int(CONFIG["AUTO_TOP_EXTRA_FRAC"] * H)
     lo = int(CONFIG["AUTO_TOP_MIN_FRAC"] * H)
     hi = int(CONFIG["AUTO_TOP_MAX_FRAC"] * H)
     off = max(lo, min(hi, idx + extra))
     return off
-
-def _cell_bbox_from_point(cx, cy, W, H, top_off):
-    grid_h = max(1, H - top_off)
-    tile_w = W / 3.0
-    tile_h = grid_h / 3.0
-    col = int(max(0, min(2, cx // tile_w)))
-    row = int(max(0, min(2, (cy - top_off) // tile_h)))
-    bx = int(col * tile_w); by = int(top_off + row * tile_h)
-    bw = int(tile_w); bh = int(tile_h)
-    inset = CONFIG["GRID_INSET"]
-    return (bx+inset, by+inset, max(1,bw-2*inset), max(1,bh-2*inset)), (row, col)
-
-def _tile_bbox_from_bbox(bb, W, H, top_off):
-    x,y,w,h = bb
-    cx = x + w/2; cy = y + h/2
-    return _cell_bbox_from_point(cx, cy, W, H, top_off)
 
 def _union_bbox(b1, b2):
     x1,y1,w1,h1 = b1; x2,y2,w2,h2 = b2
@@ -412,28 +384,18 @@ def _strip_badges(t: str) -> str:
     t = re.sub(r"\[[^\]]+\]", " ", t)
     t = re.sub(r"\([^\)]+\)", " ", t)
     return re.sub(r"\s{2,}", " ", t).strip()
-    
+
 def _normalize_label_for_match(text: str) -> str:
-    """Normalize Zoom/Teams labels for fuzzy matching."""
-    # remove badges like [US-US] or (Unverified)
     t = re.sub(r"\[[^\]]+\]|\([^)]+\)", " ", text)
     t = re.sub(r"\s{2,}", " ", t).strip()
-    # flip "Last, First" → "First Last"
     m = re.match(r"^([A-Za-z.'-]+),\s*([A-Za-z.'-]+)$", t)
     if m:
         t = f"{m.group(2)} {m.group(1)}"
     return t
 
+# ----------------------------- Screenshot OCR → tiles -----------------------------
 def ocr_to_tiles(screenshot_path: Path, attendees_name_to_company: Dict[str,str],
                  email_to_name: Dict[str,str], initials_map: Dict[str,List[str]], outdir: Path):
-    """
-    [V2_9_3]
-    - Pass A: OCR on grid region (excludes header)
-    - Pass B: OCR per-cell bottom strips (taller band; lighter bottom pad)
-    - Pass C: Per-cell center initials (PSM=8) to capture avatars like AT/TA/JR
-    - NEW: infer true grid left/right bounds from bottom-band tokens (fixes global left shift)
-    - Collapse to one winner per cell (prevents overlaps)
-    """
     set_tesseract_cmd_if_provided()
     img = cv2.imread(str(screenshot_path))
     if img is None:
