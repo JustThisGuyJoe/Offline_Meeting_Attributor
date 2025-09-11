@@ -436,7 +436,6 @@ def ocr_to_tiles(screenshot_path: Path, attendees_name_to_company: Dict[str,str]
     top_off = _auto_top_offset(gray)
     grid_h = max(1, H - top_off)
     tile_h = int(grid_h / 3.0)
-    tile_w_tmp = int(W / 3.0)
 
     # Pass A: OCR grid-only
     roi_full = gray[top_off:H, :]
@@ -446,8 +445,8 @@ def ocr_to_tiles(screenshot_path: Path, attendees_name_to_company: Dict[str,str]
         w["bbox"] = (x, top_off + y, wid, hei)
 
     # Pass B: bottom strips (single-line)
-    pad_b = float(CONFIG.get("BOTTOM_STRIP_PAD_BOTTOM_FRAC", 0.015))
-    bs_frac = float(CONFIG.get("BOTTOM_STRIP_FRAC", 0.58))
+    pad_b = float(CONFIG.get("BOTTOM_STRIP_PAD_BOTTOM_FRAC", 0.010))
+    bs_frac = float(CONFIG.get("BOTTOM_STRIP_FRAC", 0.55))
     wordsB = []
     for r in range(3):
         y1 = top_off + r * tile_h + int(tile_h * bs_frac)
@@ -463,8 +462,9 @@ def ocr_to_tiles(screenshot_path: Path, attendees_name_to_company: Dict[str,str]
             w["bbox"] = (x, y1 + y, wid, hei)
         wordsB.extend(data)
 
-    # Pass C: initials in tile centers (single word)
+    # Pass C: initials in centers
     wordsC = []
+    tile_w_tmp = int(W / 3.0)
     for r in range(3):
         for c in range(3):
             cx1 = int(c * tile_w_tmp + 0.25 * tile_w_tmp)
@@ -481,34 +481,23 @@ def ocr_to_tiles(screenshot_path: Path, attendees_name_to_company: Dict[str,str]
                 w["bbox"] = (cx1 + x, cy1 + y, wid, hei)
             wordsC.extend(data)
 
-    # Merge & filter
     words_all = wordsA + wordsB + wordsC
     words_keep = [w for w in words_all if w["conf"] >= CONFIG["OCR_WORD_CONF_MIN"] and _clean_text(w["text"])]
-    # keep grid-only tokens
     grid_min_y = top_off + 0.05 * tile_h
     def _cy(bb): x,y,w,h = bb; return y + h/2.0
     words_keep = [w for w in words_keep if _cy(w["bbox"]) >= grid_min_y]
 
-    # Infer L/R and row bounds using k-means on token centers
-    xcenters = [w["bbox"][0] + w["bbox"][2] / 2.0 for w in words_keep] or [W*0.17, W*0.50, W*0.83]
-    ycenters = [w["bbox"][1] + w["bbox"][3] / 2.0 for w in words_keep] or [top_off+grid_h*0.17, top_off+grid_h*0.50, top_off+grid_h*0.83]
-    col_cent = _kmeans1d(xcenters, k=3) or [W*0.17, W*0.50, W*0.83]
-    row_cent = _kmeans1d(ycenters, k=3) or [top_off+grid_h*0.17, top_off+grid_h*0.50, top_off+grid_h*0.83]
-    cL, cM1, cM2, cR = _bounds_from_centers(col_cent, 0, W)
-    rT, rM1, rM2, rB = _bounds_from_centers(row_cent, top_off, H)
-    if (cR - cL) / max(1.0, W) < float(CONFIG.get("MIN_GRID_WIDTH_FRAC", 0.62)):
-        cL, cM1, cM2, cR = 0, W // 3, 2 * W // 3, W
-    margin = int(float(CONFIG.get("LR_MARGIN_FRAC", 0.02)) * W)
-    cL = max(0, cL - margin); cR = min(W, cR + margin)
-    col_bounds = [cL, cM1, cM2, cR]
-    row_bounds = [rT, rM1, rM2, rB]
+    # Use full-width thirds to avoid left-shift (AUTO_LR_FROM_TOKENS disabled)
+    col_bounds = [0, W//3, 2*W//3, W]
+    row_bounds = [top_off, top_off + tile_h, top_off + 2*tile_h, H]
+    inset = int(CONFIG.get("GRID_INSET", 3))
 
     def _which_bin(val: float, edges: List[int]) -> int:
+        # edges length 4 → returns 0..2
         if val < edges[1]: return 0
         if val < edges[2]: return 1
         return 2
 
-    inset = int(CONFIG.get("GRID_INSET", 6))
     def _tile_bbox_from_point_grid(cx, cy):
         col = _which_bin(cx, col_bounds)
         row = _which_bin(cy, row_bounds)
@@ -517,16 +506,6 @@ def ocr_to_tiles(screenshot_path: Path, attendees_name_to_company: Dict[str,str]
         bx, by = x1 + inset, y1 + inset
         bw, bh = max(1, (x2 - x1) - 2*inset), max(1, (y2 - y1) - 2*inset)
         return (bx, by, bw, bh), (row, col)
-
-    # Debug overlay
-    if CONFIG["DEBUG"]:
-        dbg = img.copy()
-        for w in words_keep:
-            x, y, ww, hh = w["bbox"]
-            cv2.rectangle(dbg, (x, y), (x + ww, y + hh), (0, 255, 255), 1)
-        cv2.rectangle(dbg, (int(cL), int(rT)), (int(cR), int(rB)), (255, 0, 255), 2)
-        (outdir / "ocr_tokens_v3.png").parent.mkdir(parents=True, exist_ok=True)
-        cv2.imwrite(str(outdir / "ocr_tokens_v3.png"), dbg)
 
     # Initials-first + large-bubble heuristic
     attendee_names = list(attendees_name_to_company.keys())
@@ -551,10 +530,14 @@ def ocr_to_tiles(screenshot_path: Path, attendees_name_to_company: Dict[str,str]
                         kept_tiles[name] = tile_bb
                         kept_score[name] = score
 
-    # Phrase assembly on bottom strips (email → name → fuzzy full name)
-    # group by rows
+    # Phrase assembly (bottom strips)
+    cell_words = [w for w in words_keep if (w["bbox"][1] + w["bbox"][3]/2.0) >= top_off + tile_h * bs_frac]
+    # define bs_frac in local scope (same as used above)
+    # (re-declare to avoid UnboundLocal if edited)
+    bs_frac = float(CONFIG.get("BOTTOM_STRIP_FRAC", 0.55))
     cell_words = [w for w in words_keep if (w["bbox"][1] + w["bbox"][3]/2.0) >= top_off + tile_h * bs_frac]
     cell_words.sort(key=lambda z: (z["bbox"][1], z["bbox"][0]))
+
     lines: List[List[Dict[str, Any]]] = []
     for w in cell_words:
         if not lines: lines.append([w]); continue
@@ -580,7 +563,6 @@ def ocr_to_tiles(screenshot_path: Path, attendees_name_to_company: Dict[str,str]
                 text = _strip_badges(text)
                 bb = union_bbox_chain(toks)
 
-                # email → name
                 m = re.search(r"[A-Za-z0-9._%+-]+@([A-Za-z0-9.-]+)", text)
                 if m:
                     email = m.group(0).lower()
@@ -598,7 +580,6 @@ def ocr_to_tiles(screenshot_path: Path, attendees_name_to_company: Dict[str,str]
                             kept_score[name] = score
                         continue
 
-                # fuzzy full-name
                 if attendee_names:
                     cand = _normalize_label_for_match(text)
                     best = rf_process.extractOne(cand, attendee_names, scorer=fuzz.WRatio)
@@ -610,11 +591,12 @@ def ocr_to_tiles(screenshot_path: Path, attendees_name_to_company: Dict[str,str]
                             kept_tiles[name] = tile_bb
                             kept_score[name] = score
 
-    # Collapse to one candidate per cell (keep highest score)
+    # Collapse to one candidate per cell
     def _rc_from_bb(bb):
         cx = bb[0] + bb[2]/2.0; cy = bb[1] + bb[3]/2.0
-        _, (r,c) = _tile_bbox_from_point_grid(cx, cy)
-        return int(r), int(c)
+        col = 0 if cx < col_bounds[1] else (1 if cx < col_bounds[2] else 2)
+        row = 0 if cy < row_bounds[1] else (1 if cy < row_bounds[2] else 2)
+        return int(row), int(col)
 
     by_cell = {}
     for name, bb in kept_tiles.items():
@@ -625,7 +607,6 @@ def ocr_to_tiles(screenshot_path: Path, attendees_name_to_company: Dict[str,str]
 
     kept = [by_cell[k][0] for k in sorted(by_cell.keys())]
 
-    # Debug overlay of final grid
     if CONFIG["DEBUG"]:
         overlay = img.copy()
         for x in map(int, col_bounds):
@@ -636,11 +617,11 @@ def ocr_to_tiles(screenshot_path: Path, attendees_name_to_company: Dict[str,str]
             x, y, w, h = bb
             cv2.rectangle(overlay, (x, y), (x+w, y+h), (0,255,0), 2)
             cv2.putText(overlay, name[:20], (x+8, y+24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 1, cv2.LINE_AA)
-        cv2.imwrite(str(outdir / "tiles_from_tokens_v3.png"), overlay)
+        cv2.imwrite(str(outdir / "tiles_from_tokens_v3_1.png"), overlay)
 
     return kept, (W, H), top_off
 
-# ----------------------------- Blue mask & scoring (V3) -----------------------------
+# ----------------------------- Blue mask & scoring -----------------------------
 def _blue_mask_bgr(img_bgr: "np.ndarray") -> "np.ndarray":
     hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
     lo = np.array(CONFIG["LOWER_HSV"], dtype=np.uint8)
