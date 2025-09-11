@@ -561,112 +561,102 @@ def ocr_to_tiles(screenshot_path: Path, attendees_name_to_company: Dict[str,str]
                         if best and best[1] >= CONFIG["FUZZ_MIN_SCORE"]:
                             name = best[0]
                     if name:
-                        tile_bb, _ = _tile_bbox_from_bbox_grid(bb)
+                        tile_bb, _ = _tile_bbox_from_point_grid(bb[0] + bb[2]/2.0, bb[1] + bb[3]/2.0)
                         score = 85.0
                         if score > kept_score.get(name, -1):
                             kept_tiles[name] = tile_bb
                             kept_score[name] = score
-                            phrase_hits += 1
                         continue
 
-                # Fuzzy full-name (normalized)
+                # fuzzy full-name
                 if attendee_names:
                     cand = _normalize_label_for_match(text)
                     best = rf_process.extractOne(cand, attendee_names, scorer=fuzz.WRatio)
                     if best and best[1] >= CONFIG["FUZZ_MIN_SCORE"]:
                         name = best[0]
                         score = best[1]
-                        tile_bb, _ = _tile_bbox_from_bbox_grid(bb)
+                        tile_bb, _ = _tile_bbox_from_point_grid(bb[0] + bb[2]/2.0, bb[1] + bb[3]/2.0)
                         if score > kept_score.get(name, -1):
                             kept_tiles[name] = tile_bb
                             kept_score[name] = score
-                            phrase_hits += 1
 
-    print(f"[OCRDBG] Phrase attempts={phrase_attempts} accepted={phrase_hits}")
-
-# --- COLLAPSE: keep one best candidate per (row, col) cell ---
-_map_bbox = _tile_bbox_from_bbox_grid  # use the k-means-aware mapper
-# (fallback would be: lambda bb: _tile_bbox_from_bbox(bb, W, H, top_off))
-    if _map_bbox is None:
-        def _map_bbox(bb):
-            return _tile_bbox_from_bbox(bb, W, H, top_off)
+    # Collapse to one candidate per cell (keep highest score)
+    def _rc_from_bb(bb):
+        cx = bb[0] + bb[2]/2.0; cy = bb[1] + bb[3]/2.0
+        _, (r,c) = _tile_bbox_from_point_grid(cx, cy)
+        return int(r), int(c)
 
     by_cell = {}
     for name, bb in kept_tiles.items():
-        _, rc = _map_bbox(bb)  # rc = (row, col)
-        key = (int(rc[0]), int(rc[1]))
+        rc = _rc_from_bb(bb)
         score = float(kept_score.get(name, 0.0))
-        if key not in by_cell or score > by_cell[key][1]:
-            by_cell[key] = ((name, bb), score)
+        if rc not in by_cell or score > by_cell[rc][1]:
+            by_cell[rc] = ((name, bb), score)
 
     kept = [by_cell[k][0] for k in sorted(by_cell.keys())]
 
-    # ---------------- Debug overlay: draw inferred grid (magenta) + kept tiles (green) ----------------
-    overlay = img.copy()
-
-    # Use k-means grid bounds if they exist; otherwise fall back to equal thirds.
-    col_bounds = locals().get("col_bounds", [0, W // 3, 2 * W // 3, W])
-    row_bounds = locals().get("row_bounds", [top_off, top_off + tile_h, top_off + 2 * tile_h, H])
-
-    # Draw grid lines (magenta)
-    for x in map(int, col_bounds):
-        cv2.line(overlay, (x, int(row_bounds[0])), (x, int(row_bounds[-1])), (255, 0, 255), 2)
-    for y in map(int, row_bounds):
-        cv2.line(overlay, (int(col_bounds[0]), y), (int(col_bounds[-1]), y), (255, 0, 255), 2)
-
-    # Draw the kept attendee tiles (green)
-    for name, bb in kept:
-        x, y, w, h = bb
-        cv2.rectangle(overlay, (x, y), (x + w, y + h), (0, 255, 0), 2)
-        cv2.putText(
-            overlay, name[:20], (x + 8, y + 24),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1, cv2.LINE_AA
-        )
-
-    out_tiles = outdir / "tiles_from_tokens_v2.png"
-    cv2.imwrite(str(out_tiles), overlay)
-    print(f"[OCRDBG] Kept attendees as tiles: {len(kept)} -> {out_tiles}")
+    # Debug overlay of final grid
+    if CONFIG["DEBUG"]:
+        overlay = img.copy()
+        for x in map(int, col_bounds):
+            cv2.line(overlay, (x, int(row_bounds[0])), (x, int(row_bounds[-1])), (255, 0, 255), 2)
+        for y in map(int, row_bounds):
+            cv2.line(overlay, (int(col_bounds[0]), y), (int(col_bounds[-1]), y), (255, 0, 255), 2)
+        for name, bb in kept:
+            x, y, w, h = bb
+            cv2.rectangle(overlay, (x, y), (x+w, y+h), (0,255,0), 2)
+            cv2.putText(overlay, name[:20], (x+8, y+24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 1, cv2.LINE_AA)
+        cv2.imwrite(str(outdir / "tiles_from_tokens_v3.png"), overlay)
 
     return kept, (W, H), top_off
 
-# ----------------------------- Blue Border Detection -----------------------------
-def detect_blue_border_regions(frame: "np.ndarray") -> Tuple[List[Tuple[int,int,int,int]], "np.ndarray"]:
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    lower = np.array(CONFIG["LOWER_HSV"], dtype=np.uint8)
-    upper = np.array(CONFIG["UPPER_HSV"], dtype=np.uint8)
-    mask = cv2.inRange(hsv, lower, upper)
-    kernel = np.ones((3, 3), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    boxes = []
-    for cnt in contours:
-        x, y, w, h = cv2.boundingRect(cnt)
-        area = cv2.contourArea(cnt)
-        if w < CONFIG["MIN_BOX_W"] or h < CONFIG["MIN_BOX_H"]: continue
-        if area < CONFIG["MIN_AREA"]: continue
-        stroke_ratio = area / max(1.0, w * h)
-        if stroke_ratio > CONFIG["MAX_STROKE_RATIO"]: continue
-        boxes.append((x, y, w, h))
-    return boxes, mask
+# ----------------------------- Blue mask & scoring (V3) -----------------------------
+def _blue_mask_bgr(img_bgr: "np.ndarray") -> "np.ndarray":
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    lo = np.array(CONFIG["LOWER_HSV"], dtype=np.uint8)
+    hi = np.array(CONFIG["UPPER_HSV"], dtype=np.uint8)
 
-def match_boxes_to_tiles(boxes, tiles: List[Tile]) -> Optional[Tile]:
-    if not boxes or not tiles: return None
-    def iou(a, b):
-        ax, ay, aw, ah = a; bx, by, bw, bh = b
-        a2 = (ax+aw, ay+ah); b2 = (bx+bw, by+bh)
-        x_left = max(ax, bx); y_top = max(ay, by)
-        x_right = min(a2[0], b2[0]); y_bottom = min(a2[1], b2[1])
-        if x_right <= x_left or y_bottom <= y_top: return 0.0
-        inter = (x_right-x_left)*(y_bottom-y_top)
-        union = aw*ah + bw*bh - inter
-        return inter / max(1e-6, union)
-    best, best_iou = None, 0.0
-    for b in boxes:
-        for t in tiles:
-            i = iou(b, t.bbox)
-            if i > best_iou:
-                best_iou, best = i, t
-    return best if best_iou >= 0.05 else None
+    relax = CONFIG.get("RELAXED_BLUE_THRESHOLD", None)
+    if relax is not None:
+        lo_h, lo_s, lo_v = int(lo[0]), int(lo[1]), int(lo[2])
+        hi_h, hi_s, hi_v = int(hi[0]), int(hi[1]), int(hi[2])
+        center = (lo_h + hi_h) / 2.0
+        width  = (hi_h - lo_h) * (1.0 + float(relax))
+        new_lo = max(0,   int(center - width / 2))
+        new_hi = min(179, int(center + width / 2))
+        lo = np.array([new_lo, lo_s, lo_v], dtype=np.uint8)
+        hi = np.array([new_hi, hi_s, hi_v], dtype=np.uint8)
+
+    mask = cv2.inRange(hsv, lo, hi)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3,3), np.uint8), iterations=1)
+    return mask
+
+def _score_tiles_by_mask(frame_bgr: "np.ndarray", rows: int, cols: int) -> Tuple[Optional[int], float, "np.ndarray"]:
+    """Return (best_tile_index, best_score, mask)."""
+    if rows < 1 or cols < 1: return None, 0.0, np.zeros(frame_bgr.shape[:2], dtype=np.uint8)
+    H, W = frame_bgr.shape[:2]
+    mask = _blue_mask_bgr(frame_bgr)
+    tile_h, tile_w = H // rows, W // cols
+    total_area = H * W
+    min_area = max(1.0, float(CONFIG.get("MIN_EDGE_AREA_FRAC", 0.0005)) * total_area)
+
+    best_idx, best_score = None, 0.0
+    for r in range(rows):
+        for c in range(cols):
+            y0 = r * tile_h
+            y1 = H if r == rows - 1 else (r + 1) * tile_h
+            x0 = c * tile_w
+            x1 = W if c == cols - 1 else (c + 1) * tile_w
+
+            # Optional inner-ring focus (disabled by default)
+            tile_mask = mask[y0:y1, x0:x1]
+            score = float((tile_mask > 0).sum())
+
+            if score >= min_area and score > best_score:
+                best_score = score
+                best_idx = r * cols + c
+
+    return best_idx, best_score, mask
 
 def scale_tiles_to_frame(tiles: List[Tile], src_size: Tuple[int,int], dst_size: Tuple[int,int]) -> List[Tile]:
     sw, sh = src_size; dw, dh = dst_size
