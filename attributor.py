@@ -58,49 +58,41 @@ CONFIG = {
     "FPS_SAMPLE": 3.0,
     "VIDEO_WORKERS": 4,
 
-    # Blue border (robust)
+    # Blue border HSV (Teams/Zoom typical blue)
     "LOWER_HSV": (85, 50, 50),
     "UPPER_HSV": (140, 255, 255),
-    "MIN_BOX_W": 30,
-    "MIN_BOX_H": 30,
-    "MIN_AREA": 150,
-    "MAX_STROKE_RATIO": 0.45,
 
+    # V3: resolution-agnostic area floor for blue edges
+    "MIN_EDGE_AREA_FRAC": 0.0005,   # ~0.05% of frame
+
+    # V3: optional hue relax factor (None to disable; e.g., 0.35 to widen hue window)
+    "RELAXED_BLUE_THRESHOLD": None,
+
+    # Optional crop (x, y, w, h) to limit detection region (leave None for full frame)
     "VIDEO_CROP": None,
 
+    # OCR
     "TESSERACT_CMD": None,
-
-    "DEBUG": True,
-    "DEBUG_EVERY_N": 15,
-
-    # OCR tuning (robust)
     "OCR_LANG": "eng",
     "OCR_ALLOWED_RE": r"[^A-Za-z0-9 .,'()@\-\[\]]",
     "OCR_MIN_LEN": 2,
-    "FUZZ_MIN_SCORE": 55,
+    "FUZZ_MIN_SCORE": 55,       # from V2_8_1
     "OCR_WORD_CONF_MIN": 40,
-    "INITIALS_CONF_MIN": 40,
-    # make the bottom label band a hair taller and keep a small bottom margin
-    "BOTTOM_STRIP_FRAC": 0.58,            # was 0.62; 0.56–0.60 is a good range
-    "BOTTOM_STRIP_PAD_BOTTOM_FRAC": 0.015, # cut ~1.5% of tile height from the bottom (prevents cropping UI border)
-    "AUTO_LR_FROM_TOKENS": True,   # enable auto left/right grid bounds
-    "LR_MARGIN_FRAC": 0.02,      # a touch more margin
-    "MIN_GRID_WIDTH_FRAC": 0.62, # allow narrower inferred grids
-    "AUTO_LR_OFFSET": True,      # infer horizontal grid bounds from tokens
-    "AUTO_LR_PAD_FRAC": 0.02,    # widen inferred L/R by this fraction of W (for safety)
-
-    # Grid geometry (static screenshot path)
-    "TOP_OFFSET_FRAC": 0.09,
+    "INITIALS_CONF_MIN": 50,    # from V2_8_1
+    "BOTTOM_STRIP_FRAC": 0.58,            # bottom label band start (fraction of tile height)
+    "BOTTOM_STRIP_PAD_BOTTOM_FRAC": 0.015,# shaving a small bottom margin
+    "AUTO_LR_FROM_TOKENS": True,
+    "LR_MARGIN_FRAC": 0.02,
+    "MIN_GRID_WIDTH_FRAC": 0.62,
     "AUTO_TOP_OFFSET": True,
-    "AUTO_TOP_MIN_FRAC": 0.10,           # new
-    "AUTO_TOP_MAX_FRAC": 0.20,           # new
-    "AUTO_TOP_EXTRA_FRAC": 0.03,         # new
+    "TOP_OFFSET_FRAC": 0.09,
+    "AUTO_TOP_MIN_FRAC": 0.10,
+    "AUTO_TOP_MAX_FRAC": 0.20,
+    "AUTO_TOP_EXTRA_FRAC": 0.03,
     "GRID_INSET": 6,
+    "LARGE_BUBBLE_AREA_FRAC": 0.02,       # initials bubble heuristic
 
-    # Large-bubble initials heuristic (robust)
-    "LARGE_BUBBLE_AREA_FRAC": 0.02,
-
-    # ===================== [V2_9] Dynamic grid config =====================
+    # Dynamic grid
     "DYNAMIC_GRID": False,
     "DYNAMIC_MAX_SIDE": 4,
     "ONFRAME_OCR": True,
@@ -108,6 +100,10 @@ CONFIG = {
     "FALLBACK_IF_NO_SCREENSHOT": True,
     "EXPORT_DYNAMIC_MAP": True,
     "DYNAMIC_NAME_CACHE_TTL": 150,
+
+    # Debug
+    "DEBUG": True,
+    "DEBUG_EVERY_N": 15,
 }
 
 # ============================ Imports ============================
