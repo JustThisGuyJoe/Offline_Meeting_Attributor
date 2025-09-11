@@ -642,46 +642,93 @@ def _blue_mask_bgr(img_bgr: "np.ndarray") -> "np.ndarray":
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3,3), np.uint8), iterations=1)
     return mask
 
-def _score_tiles_by_mask(frame_bgr: "np.ndarray", rows: int, cols: int) -> Tuple[Optional[int], float, "np.ndarray"]:
-    """Return (best_tile_index, best_score, mask)."""
-    if rows < 1 or cols < 1: return None, 0.0, np.zeros(frame_bgr.shape[:2], dtype=np.uint8)
-    H, W = frame_bgr.shape[:2]
+# ----------------------------- Dynamic layout estimator -----------------------------
+class DynLayoutEstimator:
+    def __init__(self, period: int, max_side: int):
+        self.period = max(1, int(period))
+        self.max_side = max(2, int(max_side))
+        self.last_update: int = -1
+        self.col_bounds: Optional[List[int]] = None
+        self.row_bounds: Optional[List[int]] = None
+
+    def _best_centers(self, vals: List[float], kmax: int, lo: int, hi: int) -> Tuple[List[float], List[int]]:
+        """Try k=2..kmax, choose centers with largest min-gap; return (centers, bounds)."""
+        if len(vals) < 2:
+            return [ (lo+hi)/2 ], [lo, hi]
+        best_score, best_cs, best_bounds = -1.0, None, None
+        for k in range(2, min(kmax, max(2, len(vals))) + 1):
+            cs = _kmeans1d(vals, k=k)
+            if not cs: continue
+            cs = sorted(cs)
+            gaps = [cs[i+1] - cs[i] for i in range(len(cs)-1)]
+            score = min(gaps) if gaps else 0.0
+            bounds = _bounds_from_centers_generic(cs, lo, hi)
+            if score > best_score:
+                best_score, best_cs, best_bounds = score, cs, bounds
+        if best_bounds is None:
+            best_bounds = [lo, hi]
+        return best_cs or [ (lo+hi)/2 ], best_bounds
+
+    def maybe_update(self, frame_bgr: np.ndarray, frame_idx: int):
+        if self.last_update >= 0 and (frame_idx - self.last_update) < self.period:
+            return
+        self.last_update = frame_idx
+
+        H, W = frame_bgr.shape[:2]
+        y_lo_frac, y_hi_frac = CONFIG.get("LAYOUT_USE_BAND", (0.60, 0.92))
+        y1 = int(H * y_lo_frac); y2 = max(y1 + 10, int(H * y_hi_frac))
+        roi = _preproc_gray(frame_bgr[y1:y2, :])
+        toks = _tess_data(roi, psm=6)
+        toks = [t for t in toks if t["conf"] >= CONFIG["OCR_WORD_CONF_MIN"] and _clean_text(t["text"])]
+        if len(toks) < 3:
+            return  # not enough info; keep previous bounds
+
+        xs = [(t["bbox"][0] + t["bbox"][2]/2.0) for t in toks]
+        ys = [(y1 + t["bbox"][1] + t["bbox"][3]/2.0) for t in toks]
+
+        _, col_bounds = self._best_centers(xs, self.max_side, 0, W)
+        _, row_bounds = self._best_centers(ys, self.max_side, 0, H)
+
+        # Keep exactly 4 bounds (3 columns/rows) if possible; else clamp to 3×3 compatible
+        if len(col_bounds) >= 4:
+            self.col_bounds = [col_bounds[0], col_bounds[1], col_bounds[2], col_bounds[-1]]
+        else:
+            self.col_bounds = [0, W//3, 2*W//3, W]
+        if len(row_bounds) >= 4:
+            self.row_bounds = [row_bounds[0], row_bounds[1], row_bounds[2], row_bounds[-1]]
+        else:
+            self.row_bounds = [0, H//3, 2*H//3, H]
+
+    def slice(self, frame_bgr: np.ndarray) -> Dict[int, Tuple[np.ndarray, Tuple[int,int,int,int], Tuple[int,int]]]:
+        H, W = frame_bgr.shape[:2]
+        xs = self.col_bounds or [0, W//3, 2*W//3, W]
+        ys = self.row_bounds or [0, H//3, 2*H//3, H]
+        tiles: Dict[int, Tuple[np.ndarray, Tuple[int,int,int,int], Tuple[int,int]]] = {}
+        tid = 0
+        for r in range(3):
+            for c in range(3):
+                x1,x2 = int(xs[c]), int(xs[c+1])
+                y1,y2 = int(ys[r]), int(ys[r+1])
+                tiles[tid] = (frame_bgr[y1:y2, x1:x2], (x1, y1, x2-x1, y2-y1), (r, c))
+                tid += 1
+        return tiles
+
+# ----------------------------- Scoring helpers -----------------------------
+def _score_tiles_by_mask_with_bounds(frame_bgr: np.ndarray, tiles: Dict[int, Tuple[np.ndarray, Tuple[int,int,int,int], Tuple[int,int]]]) -> Tuple[Optional[int], float, np.ndarray]:
     mask = _blue_mask_bgr(frame_bgr)
-    tile_h, tile_w = H // rows, W // cols
+    H, W = frame_bgr.shape[:2]
     total_area = H * W
     min_area = max(1.0, float(CONFIG.get("MIN_EDGE_AREA_FRAC", 0.0005)) * total_area)
-
-    best_idx, best_score = None, 0.0
-    for r in range(rows):
-        for c in range(cols):
-            y0 = r * tile_h
-            y1 = H if r == rows - 1 else (r + 1) * tile_h
-            x0 = c * tile_w
-            x1 = W if c == cols - 1 else (c + 1) * tile_w
-
-            # Optional inner-ring focus (disabled by default)
-            tile_mask = mask[y0:y1, x0:x1]
-            score = float((tile_mask > 0).sum())
-
-            if score >= min_area and score > best_score:
-                best_score = score
-                best_idx = r * cols + c
-
-    return best_idx, best_score, mask
-
-def scale_tiles_to_frame(tiles: List[Tile], src_size: Tuple[int,int], dst_size: Tuple[int,int]) -> List[Tile]:
-    sw, sh = src_size; dw, dh = dst_size
-    if sw == 0 or sh == 0: return tiles
-    sx, sy = dw / sw, dh / sh
-    out = []
-    for t in tiles:
-        x, y, w, h = t.bbox
-        out.append(Tile(
-            name=t.name,
-            bbox=(int(round(x*sx)), int(round(y*sy)), int(round(w*sx)), int(round(h*sy))),
-            grid_pos=t.grid_pos
-        ))
-    return out
+    best_tid, best_score = None, 0.0
+    for tid, (_, (x,y,w,h), _) in tiles.items():
+        x0 = max(0, x); y0 = max(0, y)
+        x1 = min(W, x + w); y1 = min(H, y + h)
+        if x1 <= x0 or y1 <= y0: continue
+        tile_mask = mask[y0:y1, x0:x1]
+        score = float((tile_mask > 0).sum())
+        if score >= min_area and score > best_score:
+            best_score, best_tid = score, tid
+    return best_tid, best_score, mask
 
 # ----------------------------- Alignment & Normalization -----------------------------
 VOCAB_RULES = [
@@ -691,6 +738,7 @@ VOCAB_RULES = [
     (r"\bOmitron\b", "Omitron"),
     (r"\b[Ee]phemerides\b", "ephemeris"),
 ]
+
 def apply_vocab_rules(text: str) -> str:
     out = text
     for pat, repl in VOCAB_RULES: out = re.sub(pat, repl, out, flags=re.IGNORECASE)
@@ -709,13 +757,13 @@ def map_tile_to_attendee_name(tile_name: str, attendees: Dict[str, str]) -> str:
         return best[0]
     return tile_name
 
+# ----------------------------- Segment attribution (vote) -----------------------------
 def overlap(a, b):
     s1, e1 = a; s2, e2 = b
     s = max(s1, s2); e = min(e1, e2)
     return max(0.0, e - s)
 
 def attribute_segments(segments: List[Dict], timeline: List[SpeakerEvent], attendees: Dict[str, str]) -> List['TranscriptSegment']:
-    """V3: vote by accumulated active duration inside a padded window per segment."""
     if not segments: return []
     events = sorted(timeline, key=lambda e: e.start)
     out: List[TranscriptSegment] = []
@@ -767,37 +815,18 @@ class DynamicGridAttributor:
             print(f"[DynGrid] {msg}")
 
     def detect_grid_size(self, frame: np.ndarray) -> Tuple[int, int]:
-        # Simple heuristic: assume near-square tiles; bound by rows_max
-        h, w = frame.shape[:2]
-        approx_tile = max(1, min(h, w) // self.rows_max)
-        rows = max(1, min(self.rows_max, h // max(1, approx_tile)))
-        cols = max(1, min(self.rows_max, w // max(1, approx_tile)))
-        return rows, cols
+        # We keep 3×3 slicing; bounds come from DynLayoutEstimator
+        return 3, 3
 
-    def slice_grid(self, frame: np.ndarray, rows: int, cols: int) -> Dict[int, Tuple[np.ndarray, Tuple[int,int,int,int], Tuple[int,int]]]:
-        h, w = frame.shape[:2]
-        tile_h, tile_w = h // rows, w // cols
-        tiles: Dict[int, Tuple[np.ndarray, Tuple[int,int,int,int], Tuple[int,int]]] = {}
-        tid = 0
-        for r in range(rows):
-            for c in range(cols):
-                y1, y2 = r * tile_h, (r + 1) * tile_h
-                x1, x2 = c * tile_w, (c + 1) * tile_w
-                tiles[tid] = (frame[y1:y2, x1:x2], (x1, y1, x2 - x1, y2 - y1), (r, c))
-                tid += 1
-        return tiles
-
-    def name_from_tile(self, tile_img: np.ndarray, attendees: Dict[str,str],
-                       initials_map: Dict[str, List[str]]) -> Optional[str]:
+    def name_from_tile(self, tile_img: np.ndarray, attendees: Dict[str,str], initials_map: Dict[str, List[str]]) -> Optional[str]:
         if not CONFIG["ONFRAME_OCR"]:
             return None
         h, w = tile_img.shape[:2]
-        frac = float(CONFIG.get("BOTTOM_STRIP_FRAC", 0.58))
+        frac = float(CONFIG.get("BOTTOM_STRIP_FRAC", 0.55))
         y1 = int(h * frac)
         y2 = max(y1 + 5, h - 2)
         roi = _preproc_gray(tile_img[y1:y2, :])
         toks = _tess_data(roi, psm=7)
-
         texts = [t for t in toks if t["conf"] >= CONFIG["OCR_WORD_CONF_MIN"] and t["text"]]
         if not texts:
             return None
@@ -806,13 +835,11 @@ class DynamicGridAttributor:
         line = _strip_badges(line)
         if not line:
             return None
-
         if attendees:
             cand = _normalize_label_for_match(line)
             best = rf_process.extractOne(cand, list(attendees.keys()), scorer=fuzz.WRatio)
             if best and best[1] >= CONFIG["FUZZ_MIN_SCORE"]:
                 return best[0]
-
         for t in texts:
             token = _clean_text(t["text"]).upper()
             if re.fullmatch(r"[A-Z]{2}", token):
@@ -828,8 +855,7 @@ class DynamicGridAttributor:
         self.speaker_map[tid]["last_seen"] = self.frame_count
 
     def prune_stale(self, ttl: int):
-        doomed = [tid for tid, meta in self.speaker_map.items()
-                  if (self.frame_count - meta.get("last_seen", -1)) > ttl]
+        doomed = [tid for tid, meta in self.speaker_map.items() if (self.frame_count - meta.get("last_seen", -1)) > ttl]
         for tid in doomed:
             self.speaker_map.pop(tid, None)
 
