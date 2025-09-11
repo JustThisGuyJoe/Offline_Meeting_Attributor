@@ -771,10 +771,7 @@ def attribute_segments(segments: List[Dict], timeline: List[SpeakerEvent], atten
     for seg in segments:
         s_start, s_end, s_text = float(seg["start"]), float(seg["end"]), apply_vocab_rules(seg["text"])
         s_prob = seg.get("prob", None)
-
-        # gather candidates with small temporal pad
         pad = 0.25
-        # advance pointer
         while i < len(events) and events[i].end < s_start - pad: i += 1
         j = i; counts: Dict[str, float] = {}
         while j < len(events) and events[j].start <= s_end + pad:
@@ -783,15 +780,11 @@ def attribute_segments(segments: List[Dict], timeline: List[SpeakerEvent], atten
             if dur > 0:
                 counts[ev.tile_name] = counts.get(ev.tile_name, 0.0) + dur
             j += 1
-
         if not counts:
-            out.append(TranscriptSegment(start=s_start, end=s_end, text=s_text, speaker=None, validated=False, prob=s_prob))
-            continue
-
+            out.append(TranscriptSegment(start=s_start, end=s_end, text=s_text, speaker=None, validated=False, prob=s_prob)); continue
         chosen_name = max(counts.items(), key=lambda kv: kv[1])[0]
         mapped = map_tile_to_attendee_name(chosen_name, attendees)
         out.append(TranscriptSegment(start=s_start, end=s_end, text=s_text, speaker=mapped, validated=True, prob=s_prob))
-
     return out
 
 def attribute_segments_transcript_only(segments: List[Dict], placeholder: str) -> List['TranscriptSegment']:
@@ -802,7 +795,25 @@ def attribute_segments_transcript_only(segments: List[Dict], placeholder: str) -
         out.append(TranscriptSegment(start=s_start, end=s_end, text=s_text, speaker=placeholder, validated=False, prob=s_prob))
     return out
 
-# ----------------------------- [V2_9] Dynamic Grid Helper -----------------------------
+# ----------------------------- Perspective warp helper -----------------------------
+def _maybe_warp(frame: np.ndarray) -> np.ndarray:
+    quad = CONFIG.get("WARP_QUAD")
+    size = CONFIG.get("WARP_SIZE")
+    if not quad or not size:
+        return frame
+    dstW, dstH = int(size[0]), int(size[1])
+    if dstW <= 0 or dstH <= 0:
+        return frame
+    try:
+        src = np.float32(quad)
+        dst = np.float32([(0,0),(dstW,0),(dstW,dstH),(0,dstH)])
+        M = cv2.getPerspectiveTransform(src, dst)
+        return cv2.warpPerspective(frame, M, (dstW, dstH))
+    except Exception as e:
+        print(f"[WARP] failed: {e}")
+        return frame
+
+# ----------------------------- Dynamic grid orchestrator -----------------------------
 class DynamicGridAttributor:
     def __init__(self, rows_max: int = 4, verbose: bool = True):
         self.rows_max = max(1, rows_max)
@@ -871,12 +882,6 @@ def build_active_speaker_timeline(
     initials_map: Optional[Dict[str, List[str]]] = None,
     dynamic_export_path: Optional[Path] = None
 ) -> Tuple[List[SpeakerEvent], Optional[DynamicGridAttributor]]:
-    """
-    Build active-speaker timeline.
-    - Static mode: score mask per known tile bbox (scaled from screenshot).
-    - Dynamic mode (V3): score mask per grid cell (rows×cols) and pick the best tile each frame.
-    Returns timeline and optional DynamicGridAttributor (for exporting a map).
-    """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     cap = cv2.VideoCapture(str(video_path))
@@ -895,41 +900,38 @@ def build_active_speaker_timeline(
     step = int(max(1, round(native_fps / max(0.1, fps))))
     idx = 0
     jobs = []
-    dyn = DynamicGridAttributor(
-        rows_max=CONFIG["DYNAMIC_MAX_SIDE"],
-        verbose=bool(CONFIG["DEBUG"])
-    ) if dynamic_mode else None
+
+    dyn = DynamicGridAttributor(rows_max=CONFIG["DYNAMIC_MAX_SIDE"], verbose=bool(CONFIG["DEBUG"])) if dynamic_mode else None
+    layout = DynLayoutEstimator(period=CONFIG["LAYOUT_UPDATE_PERIOD"], max_side=CONFIG["DYNAMIC_MAX_SIDE"]) if dynamic_mode else None
 
     def _detect_one_frame(ts: float, frame):
-        # Return the frame for debugging + mask for overlay if needed
-        best_tid = None
-        best_score = 0.0
-        mask_dbg = None
-        rows = cols = None
-
-        if dynamic_mode and dyn is not None:
-            rows, cols = dyn.detect_grid_size(frame)
-            best_tid, best_score, mask_dbg = _score_tiles_by_mask(frame, rows, cols)
+        frame = crop_frame(frame)
+        frame = _maybe_warp(frame)
+        if dynamic_mode and dyn is not None and layout is not None:
+            rows, cols = dyn.detect_grid_size(frame)  # 3×3 logical grid
+            best_tid = None; best_score = 0.0
+            layout.maybe_update(frame, int(ts * 1000))  # use ms as monotonically increasing index
+            tiles_dyn = layout.slice(frame)
+            best_tid, best_score, mask_dbg = _score_tiles_by_mask_with_bounds(frame, tiles_dyn)
+            return ts, ("dynamic", best_tid, best_score, tiles_dyn), frame if CONFIG["DEBUG"] else None, mask_dbg
         else:
-            # Static mode: score across provided tile bboxes
+            # static: use provided tiles (scaled earlier)
             mask_dbg = _blue_mask_bgr(frame)
-            best_name, best_score = None, 0.0
             H, W = frame.shape[:2]
             total_area = H * W
             min_area = max(1.0, float(CONFIG.get("MIN_EDGE_AREA_FRAC", 0.0005)) * total_area)
+            best_name, best_score = None, 0.0
             for t in tiles:
                 x, y, w, h = t.bbox
-                x2 = min(W, x + w); y2 = min(H, y + h)
-                if x >= W or y >= H or x2 <= 0 or y2 <= 0:
-                    continue
-                tile_mask = mask_dbg[max(0,y):max(0,y2), max(0,x):max(0,x2)]
+                x0 = max(0, x); y0 = max(0, y)
+                x1 = min(W, x + w); y1 = min(H, y + h)
+                if x1 <= x0 or y1 <= y0: continue
+                tile_mask = mask_dbg[y0:y1, x0:x1]
                 score = float((tile_mask > 0).sum())
                 if score >= min_area and score > best_score:
                     best_score = score
                     best_name = t.name
-            return ts, ("static", best_name, best_score, None, None), frame if CONFIG["DEBUG"] else None, mask_dbg
-
-        return ts, ("dynamic", best_tid, best_score, rows, cols), frame if CONFIG["DEBUG"] else None, mask_dbg
+            return ts, ("static", best_name, best_score, None), frame if CONFIG["DEBUG"] else None, mask_dbg
 
     with ThreadPoolExecutor(max_workers=max(1, video_workers)) as ex:
         while True:
@@ -939,7 +941,6 @@ def build_active_speaker_timeline(
                 ret, frame = cap.retrieve()
                 if not ret or frame is None: break
                 ts = idx / native_fps
-                frame = crop_frame(frame)
                 jobs.append(ex.submit(_detect_one_frame, ts, frame))
             idx += 1
 
@@ -948,51 +949,37 @@ def build_active_speaker_timeline(
 
         for fut in as_completed(jobs):
             ts, result, frame_dbg, mask_dbg = fut.result()
-
-            if result[0] == "dynamic" and dyn is not None:
-                _, best_tid, best_score, rows, cols = result
+            if result[0] == "dynamic" and dyn is not None and layout is not None:
+                _, best_tid, best_score, tiles_dyn = result
                 dyn.frame_count += 1
                 dyn.prune_stale(CONFIG["DYNAMIC_NAME_CACHE_TTL"])
-
-                if best_tid is not None and rows and cols:
-                    tiles_dyn = dyn.slice_grid(frame_dbg if frame_dbg is not None else mask_dbg, rows, cols)
-                    if best_tid in tiles_dyn:
-                        tile_img, tile_bb, (rr, cc) = tiles_dyn[best_tid]
-                        name = dyn.name_from_tile(tile_img, attendees or {}, initials_map or {}) or f"Tile{rr}{cc}"
-                        dyn.update_map(best_tid, name)
-                        raw_events.append(SpeakerEvent(start=ts, end=ts, tile_name=name, validated=True))
-
-                        if CONFIG["DEBUG"] and debug_dir and frame_dbg is not None:
-                            if debug_counter % CONFIG["DEBUG_EVERY_N"] == 0:
-                                canvas = frame_dbg.copy()
-                                # draw grid
-                                H, W = canvas.shape[:2]
-                                tile_h, tile_w = H // rows, W // cols
-                                for r in range(rows):
-                                    for c in range(cols):
-                                        y1 = r * tile_h; y2 = (r+1)*tile_h if r < rows-1 else H
-                                        x1 = c * tile_w; x2 = (c+1)*tile_w if c < cols-1 else W
-                                        color = (0, 255, 0) if (r*cols+c) == best_tid else (0, 128, 0)
-                                        cv2.rectangle(canvas, (x1, y1), (x2, y2), color, 2)
-                                cv2.imwrite(str(debug_dir / f"frame_{int(ts*1000):08d}.jpg"), canvas)
-                                if mask_dbg is not None:
-                                    cv2.imwrite(str(debug_dir / f"mask_{int(ts*1000):08d}.png"), mask_dbg)
-                            debug_counter += 1
-
+                if best_tid is not None and best_tid in tiles_dyn:
+                    tile_img, tile_bb, (rr, cc) = tiles_dyn[best_tid]
+                    name = dyn.name_from_tile(tile_img, attendees or {}, initials_map or {}) or f"Tile{rr}{cc}"
+                    dyn.update_map(best_tid, name)
+                    raw_events.append(SpeakerEvent(start=ts, end=ts, tile_name=name, validated=True))
+                if CONFIG["DEBUG"] and debug_dir and frame_dbg is not None and tiles_dyn:
+                    if debug_counter % CONFIG["DEBUG_EVERY_N"] == 0:
+                        canvas = frame_dbg.copy()
+                        # draw grid bounds
+                        for _, bb, (r,c) in tiles_dyn.values():
+                            x,y,w,h = bb
+                            color = (0,255,0)
+                            cv2.rectangle(canvas, (x,y), (x+w,y+h), color, 2)
+                        cv2.imwrite(str(debug_dir / f"frame_{int(ts*1000):08d}.jpg"), canvas)
+                        if mask_dbg is not None:
+                            cv2.imwrite(str(debug_dir / f"mask_{int(ts*1000):08d}.png"), mask_dbg)
+                    debug_counter += 1
             else:
-                # static mode result
-                _, best_name, best_score, _, _ = result
+                _, best_name, best_score, _ = result
                 if best_name is not None:
                     raw_events.append(SpeakerEvent(start=ts, end=ts, tile_name=best_name, validated=True))
                 if CONFIG["DEBUG"] and debug_dir and frame_dbg is not None:
                     if debug_counter % CONFIG["DEBUG_EVERY_N"] == 0:
                         canvas = frame_dbg.copy()
-                        # draw provided tiles
                         for t in tiles:
                             x, y, w, h = t.bbox
                             cv2.rectangle(canvas, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                            if t.name == best_name:
-                                cv2.putText(canvas, "ACTIVE", (x+8, y+24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 1, cv2.LINE_AA)
                         cv2.imwrite(str(debug_dir / f"frame_{int(ts*1000):08d}.jpg"), canvas)
                         if mask_dbg is not None:
                             cv2.imwrite(str(debug_dir / f"mask_{int(ts*1000):08d}.png"), mask_dbg)
@@ -1000,7 +987,6 @@ def build_active_speaker_timeline(
 
     cap.release()
 
-    # Optional export of the dynamic speaker map
     if dynamic_mode and dyn is not None and CONFIG["EXPORT_DYNAMIC_MAP"] and dynamic_export_path:
         try:
             with open(dynamic_export_path, "w", encoding="utf-8") as f:
