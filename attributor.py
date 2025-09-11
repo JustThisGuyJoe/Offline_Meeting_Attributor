@@ -1,27 +1,41 @@
 #!/usr/bin/env python3
 """
-attributor.py  (V2_9)
+attributor.py  (V3)
 
-Purpose
--------
-Offline Teams/Zoom-style meeting attribution:
-- Parse .ics attendees (names, emails, companies)
-- OCR screenshot (tokens + cell-bottom labels) → infer 3×3 tiles
-- Detect active speaker via blue border and attribute transcript segments
-- Generate VTT + JSON + QA report
-- GPU-first STT (faster-whisper), with CPU fallbacks
+Purpose (roll-up from prior project specs with targeted V3 changes)
+------------------------------------------------------------------
+Offline Teams/Zoom-style meeting attribution with:
+- .ics attendee parsing (names, emails → normalized names/companies)
+- OCR on screenshot(s) for tile/name mapping (bottom-label emphasis, initials heuristic)
+- Dynamic OR static grid attribution of active speaker via BLUE BORDER detection
+- Corrected VTT (+ "*" for visually validated), JSON artifacts, and QA report
+- GPU-first STT fallback (only when transcript is absent)
 
-This patch (V2_9) adds on top of V2_8_1:
-- [V2_9] Dynamic grid support (heuristic 3×3 / 4×4 / paged layouts)
-- [V2_9] Per-frame blue-border → grid-tile mapping (no fixed screenshot layout required)
-- [V2_9] Optional on-frame OCR of bottom labels to resolve names as tiles move
-- [V2_9] Transcript-only fallback when no screenshot (placeholder speaker)
-- [V2_9] Export of dynamic speaker map (JSON) with last-seen indices
-- [V2_9] New CLI flag --dynamic-grid and config toggles under CONFIG
+V3 DELTAS (applied from the "710-line roll-up" guidance)
+--------------------------------------------------------
+1) Mask-per-tile scoring (NOT contour IoU):
+   - We compute a blue HSV mask and SUM the mask pixels INSIDE each grid tile.
+   - Pick the max-scoring tile per frame with a frame-area-relative floor.
+
+2) Resolution-agnostic thresholds:
+   - Use MIN_EDGE_AREA_FRAC (fraction of full-frame area) instead of fixed pixel MIN_AREA/MIN_BOX_*.
+
+3) Hue relax toggle:
+   - Optional RELAXED_BLUE_THRESHOLD (e.g., 0.35) widens the HSV hue window for pale/pastel borders.
+   - Exposed via CLI --relaxed-blue-threshold, or set in CONFIG.
+
+4) Segment voting across frames:
+   - When assigning transcript segments to speakers, vote by accumulated active duration
+     within a small padded time window for stability (kills flicker).
+
+Other behavior is unchanged from your V2_9: dynamic grid helper, on-frame OCR for tile names,
+extended .ics parsing, vocab normalization, and robust OCR heuristics.
 
 Run
 ---
     python attributor.py --interactive
+    # or with flags:
+    python attributor.py --video meeting.mp4 --screenshot grid.png --ics invite.ics --outdir out --dynamic-grid --relaxed-blue-threshold 0.35
 """
 
 from __future__ import annotations
