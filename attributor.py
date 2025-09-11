@@ -311,22 +311,21 @@ def _clean_text(txt: str) -> str:
 def _kmeans1d(vals: List[float], k: int = 3, iters: int = 30) -> Optional[List[float]]:
     if not vals or len(vals) < k:
         return None
-    v = np.array(sorted(vals), dtype=np.float32)
-    # init with quantiles
-    qs = np.linspace(0, 1, k + 2)[1:-1]
-    cent = np.array([np.quantile(v, q) for q in qs], dtype=np.float32)
+    import numpy as _np
+    v = _np.array(sorted(vals), dtype=_np.float32)
+    qs = _np.linspace(0, 1, k + 2)[1:-1]
+    cent = _np.array([_np.quantile(v, q) for q in qs], dtype=_np.float32)
     for _ in range(iters):
-        d = np.abs(v[:, None] - cent[None, :])
-        lab = np.argmin(d, axis=1)
-        new = np.array([(v[lab == i].mean() if np.any(lab == i) else cent[i]) for i in range(k)], dtype=np.float32)
-        if np.allclose(new, cent, atol=1e-2):
+        d = _np.abs(v[:, None] - cent[None, :])
+        lab = _np.argmin(d, axis=1)
+        new = _np.array([(v[lab == i].mean() if _np.any(lab == i) else cent[i]) for i in range(k)], dtype=_np.float32)
+        if _np.allclose(new, cent, atol=1e-2):
             break
         cent = new
     cent.sort()
     return cent.tolist()
 
 def _bounds_from_centers(cs: List[float], lo: int, hi: int) -> Tuple[int,int,int,int]:
-    """Return (left, mid1, mid2, right) from three sorted centers, clamped to [lo,hi]."""
     c0, c1, c2 = cs
     left  = int(max(lo, c0 - (c1 - c0) / 2.0))
     right = int(min(hi, c2 + (c2 - c1) / 2.0))
