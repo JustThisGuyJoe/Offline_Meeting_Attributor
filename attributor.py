@@ -256,6 +256,8 @@ def hhmmss(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
 
 # ----------------------------- ICS Parsing (extended) -----------------------------
+from icalendar import Calendar
+
 def parse_ics_attendees_extended(ics_path: Path) -> Tuple[Dict[str,str], Dict[str,str], Dict[str,List[str]]]:
     text = ics_path.read_bytes()
     cal = Calendar.from_ical(text)
@@ -288,7 +290,6 @@ def parse_ics_attendees_extended(ics_path: Path) -> Tuple[Dict[str,str], Dict[st
             sval = str(org)
             mcn = re.search(r"CN=([^:;]+)", sval); men = re.search(r"mailto:([^>\s]+)", sval, re.I)
             record(mcn.group(1) if mcn else None, men.group(1) if men else None)
-
         raw_atts = comp.get("attendee") or comp.get("ATTENDEE") or []
         if not isinstance(raw_atts, list): raw_atts = [raw_atts]
         for att in raw_atts:
@@ -325,34 +326,42 @@ def set_tesseract_cmd_if_provided():
 
 def _clean_text(txt: str) -> str:
     txt = re.sub(r"[\r\n]+", " ", txt).strip()
-    txt = re.sub(CONFIG["OCR_ALLOWED_RE"], "", txt)  # strip disallowed chars
+    txt = re.sub(CONFIG["OCR_ALLOWED_RE"], "", txt)
     txt = re.sub(r"\s{2,}", " ", txt)
     return txt.strip()
 
 def _kmeans1d(vals: List[float], k: int = 3, iters: int = 30) -> Optional[List[float]]:
     if not vals or len(vals) < k:
         return None
-    import numpy as _np
-    v = _np.array(sorted(vals), dtype=_np.float32)
-    qs = _np.linspace(0, 1, k + 2)[1:-1]
-    cent = _np.array([_np.quantile(v, q) for q in qs], dtype=_np.float32)
+    v = np.array(sorted(vals), dtype=np.float32)
+    qs = np.linspace(0, 1, k + 2)[1:-1]
+    cent = np.array([np.quantile(v, q) for q in qs], dtype=np.float32)
     for _ in range(iters):
-        d = _np.abs(v[:, None] - cent[None, :])
-        lab = _np.argmin(d, axis=1)
-        new = _np.array([(v[lab == i].mean() if _np.any(lab == i) else cent[i]) for i in range(k)], dtype=_np.float32)
-        if _np.allclose(new, cent, atol=1e-2):
+        d = np.abs(v[:, None] - cent[None, :])
+        lab = np.argmin(d, axis=1)
+        new = np.array([(v[lab == i].mean() if np.any(lab == i) else cent[i]) for i in range(k)], dtype=np.float32)
+        if np.allclose(new, cent, atol=1e-2):
             break
         cent = new
     cent.sort()
     return cent.tolist()
 
-def _bounds_from_centers(cs: List[float], lo: int, hi: int) -> Tuple[int,int,int,int]:
-    c0, c1, c2 = cs
-    left  = int(max(lo, c0 - (c1 - c0) / 2.0))
-    right = int(min(hi, c2 + (c2 - c1) / 2.0))
-    mid1  = int((c0 + c1) / 2.0)
-    mid2  = int((c1 + c2) / 2.0)
-    return left, mid1, mid2, right
+def _bounds_from_centers_generic(cs: List[float], lo: int, hi: int) -> List[int]:
+    """Given sorted centers, return list of bounds of length len(cs)+1 clamped to [lo,hi]."""
+    if not cs:
+        return [lo, hi]
+    cs = sorted(cs)
+    bounds = [lo]
+    for i in range(1, len(cs)):
+        bounds.append(int(round((cs[i-1] + cs[i]) / 2.0)))
+    bounds.append(hi)
+    # clamp monotonic
+    for i in range(1, len(bounds)):
+        if bounds[i] <= bounds[i-1]:
+            bounds[i] = bounds[i-1] + 1
+    bounds[0] = max(bounds[0], lo)
+    bounds[-1] = min(bounds[-1], hi)
+    return bounds
 
 def _preproc_gray(img_bgr):
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
@@ -414,7 +423,7 @@ def _normalize_label_for_match(text: str) -> str:
         t = f"{m.group(2)} {m.group(1)}"
     return t
 
-# ----------------------------- Screenshot OCR → tiles -----------------------------
+# ----------------------------- Screenshot OCR → tiles (names) -----------------------------
 def ocr_to_tiles(screenshot_path: Path, attendees_name_to_company: Dict[str,str],
                  email_to_name: Dict[str,str], initials_map: Dict[str,List[str]], outdir: Path):
     set_tesseract_cmd_if_provided()
