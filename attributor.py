@@ -404,21 +404,18 @@ def ocr_to_tiles(screenshot_path: Path, attendees_name_to_company: Dict[str,str]
     H, W = img.shape[:2]
     gray = _preproc_gray(img)
     top_off = _auto_top_offset(gray)
-    print(f"[GRID] top_offset={top_off} (auto={'on' if CONFIG['AUTO_TOP_OFFSET'] else 'off'})")
-
-    # Initial 3×3 geometry (temporary; we will refine L/R below)
     grid_h = max(1, H - top_off)
     tile_h = int(grid_h / 3.0)
     tile_w_tmp = int(W / 3.0)
 
-    # ---------------- Pass A: OCR on GRID ONLY ----------------
+    # Pass A: OCR grid-only
     roi_full = gray[top_off:H, :]
     wordsA = _tess_data(roi_full, psm=6)
     for w in wordsA:
         x, y, wid, hei = w["bbox"]
-        w["bbox"] = (x, top_off + y, wid, hei)  # restore absolute coords
+        w["bbox"] = (x, top_off + y, wid, hei)
 
-    # ---------------- Pass B: OCR bottom strips per cell ----------------
+    # Pass B: bottom strips (single-line)
     pad_b = float(CONFIG.get("BOTTOM_STRIP_PAD_BOTTOM_FRAC", 0.015))
     bs_frac = float(CONFIG.get("BOTTOM_STRIP_FRAC", 0.58))
     wordsB = []
@@ -427,17 +424,16 @@ def ocr_to_tiles(screenshot_path: Path, attendees_name_to_company: Dict[str,str]
         y2 = top_off + (r + 1) * tile_h - int(tile_h * pad_b)
         y1 = max(top_off, min(H - 2, y1))
         y2 = max(y1 + 4, min(H, y2))
-        # use full width here; we will map to refined grid later
         roi = gray[y1:y2, :]
         if roi.size == 0:
             continue
-        data = _tess_data(roi, psm=7)  # single line is best for nameplates
+        data = _tess_data(roi, psm=7)
         for w in data:
             x, y, wid, hei = w["bbox"]
             w["bbox"] = (x, y1 + y, wid, hei)
         wordsB.extend(data)
 
-    # ---------------- Pass C: INITIALS in center of each tile ----------------
+    # Pass C: initials in tile centers (single word)
     wordsC = []
     for r in range(3):
         for c in range(3):
@@ -448,67 +444,41 @@ def ocr_to_tiles(screenshot_path: Path, attendees_name_to_company: Dict[str,str]
             cx1 = max(0, min(W-2, cx1)); cx2 = max(cx1+4, min(W, cx2))
             cy1 = max(top_off, min(H-2, cy1)); cy2 = max(cy1+4, min(H, cy2))
             roi = gray[cy1:cy2, cx1:cx2]
-            if roi.size == 0:
-                continue
-            data = _tess_data(roi, psm=8)  # single word
+            if roi.size == 0: continue
+            data = _tess_data(roi, psm=8)
             for w in data:
                 x, y, wid, hei = w["bbox"]
                 w["bbox"] = (cx1 + x, cy1 + y, wid, hei)
             wordsC.extend(data)
 
-    # Merge & base filter
+    # Merge & filter
     words_all = wordsA + wordsB + wordsC
     words_keep = [w for w in words_all if w["conf"] >= CONFIG["OCR_WORD_CONF_MIN"] and _clean_text(w["text"])]
-
-    # Hard filter: token center must be within the grid (avoid header/toolbar)
-    def _cy(bb):
-        x, y, w, h = bb
-        return y + h / 2.0
+    # keep grid-only tokens
     grid_min_y = top_off + 0.05 * tile_h
+    def _cy(bb): x,y,w,h = bb; return y + h/2.0
     words_keep = [w for w in words_keep if _cy(w["bbox"]) >= grid_min_y]
 
-    # ================== NEW: infer 3×3 grid via 1-D k-means ==================
-    # prefer nameplate tokens (bottom strip)
-    def token_in_bottom_strip(w):
-        x, y, ww, hh = w["bbox"]
-        cy = y + hh / 2.0
-        return cy >= top_off + tile_h * bs_frac
-
-    bottom_tokens = [w for w in words_keep if token_in_bottom_strip(w)]
-    use_tokens = bottom_tokens if bottom_tokens else words_keep
-
-    # collect centers
-    xcenters = [w["bbox"][0] + w["bbox"][2] / 2.0 for w in use_tokens]
-    ycenters = [w["bbox"][1] + w["bbox"][3] / 2.0 for w in use_tokens]
-
+    # Infer L/R and row bounds using k-means on token centers
+    xcenters = [w["bbox"][0] + w["bbox"][2] / 2.0 for w in words_keep] or [W*0.17, W*0.50, W*0.83]
+    ycenters = [w["bbox"][1] + w["bbox"][3] / 2.0 for w in words_keep] or [top_off+grid_h*0.17, top_off+grid_h*0.50, top_off+grid_h*0.83]
     col_cent = _kmeans1d(xcenters, k=3) or [W*0.17, W*0.50, W*0.83]
-    row_cent = _kmeans1d(ycenters, k=3) or [top_off + grid_h*0.17, top_off + grid_h*0.50, top_off + grid_h*0.83]
-
-    # turn centers into boundaries
+    row_cent = _kmeans1d(ycenters, k=3) or [top_off+grid_h*0.17, top_off+grid_h*0.50, top_off+grid_h*0.83]
     cL, cM1, cM2, cR = _bounds_from_centers(col_cent, 0, W)
     rT, rM1, rM2, rB = _bounds_from_centers(row_cent, top_off, H)
-
-    # If the inferred width is implausibly small, fall back to full width.
     if (cR - cL) / max(1.0, W) < float(CONFIG.get("MIN_GRID_WIDTH_FRAC", 0.62)):
         cL, cM1, cM2, cR = 0, W // 3, 2 * W // 3, W
-
-    # optional margin
     margin = int(float(CONFIG.get("LR_MARGIN_FRAC", 0.02)) * W)
     cL = max(0, cL - margin); cR = min(W, cR + margin)
-
-    # final grid bounds
     col_bounds = [cL, cM1, cM2, cR]
     row_bounds = [rT, rM1, rM2, rB]
-    print(f"[GRID] 3x3 from kmeans: cols={col_bounds} rows={row_bounds}")
 
-    # mapping helpers that respect these bounds
-    inset = int(CONFIG.get("GRID_INSET", 6))
     def _which_bin(val: float, edges: List[int]) -> int:
-        # edges length 4 → returns 0,1,2
         if val < edges[1]: return 0
         if val < edges[2]: return 1
         return 2
 
+    inset = int(CONFIG.get("GRID_INSET", 6))
     def _tile_bbox_from_point_grid(cx, cy):
         col = _which_bin(cx, col_bounds)
         row = _which_bin(cy, row_bounds)
@@ -518,31 +488,26 @@ def ocr_to_tiles(screenshot_path: Path, attendees_name_to_company: Dict[str,str]
         bw, bh = max(1, (x2 - x1) - 2*inset), max(1, (y2 - y1) - 2*inset)
         return (bx, by, bw, bh), (row, col)
 
-    def _tile_bbox_from_bbox_grid(bb):
-        x, y, w, h = bb
-        return _tile_bbox_from_point_grid(x + w/2.0, y + h/2.0)
+    # Debug overlay
+    if CONFIG["DEBUG"]:
+        dbg = img.copy()
+        for w in words_keep:
+            x, y, ww, hh = w["bbox"]
+            cv2.rectangle(dbg, (x, y), (x + ww, y + hh), (0, 255, 255), 1)
+        cv2.rectangle(dbg, (int(cL), int(rT)), (int(cR), int(rB)), (255, 0, 255), 2)
+        (outdir / "ocr_tokens_v3.png").parent.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(outdir / "ocr_tokens_v3.png"), dbg)
 
-# Debug overlay of OCR tokens + detected grid box
-dbg = img.copy()
-for w in words_keep:
-    x, y, ww, hh = w["bbox"]
-    cv2.rectangle(dbg, (x, y), (x + ww, y + hh), (0, 255, 255), 1)
-# use k-means bounds
-cv2.rectangle(dbg, (int(cL), int(rT)), (int(cR), int(rB)), (255, 0, 255), 2)
-cv2.imwrite(str(outdir / "ocr_tokens_v2.png"), dbg)
-print(
-    f"[OCRDBG] Tokens conf>={CONFIG['OCR_WORD_CONF_MIN']}: {len(words_keep)} | "
-    f"cols L/M1/M2/R=({cL},{cM1},{cM2},{cR}) | rows T/M1/M2/B=({rT},{rM1},{rM2},{rB})"
-)
+    # Initials-first + large-bubble heuristic
+    attendee_names = list(attendees_name_to_company.keys())
+    kept_tiles: Dict[str, Tuple[int,int,int,int]] = {}
+    kept_score: Dict[str, float] = {}
 
-    # ---------------- Initials-first + large-bubble heuristic ----------------
-    init_hits = 0
-    init_seen = 0
     for w in words_keep:
         t = _clean_text(w["text"]).upper()
         if re.fullmatch(r"[A-Z]{2}", t):
-            init_seen += 1
-            tile_bb, _ = _tile_bbox_from_bbox_grid(w["bbox"])
+            tile_bb, _ = _tile_bbox_from_point_grid(w["bbox"][0] + w["bbox"][2]/2.0,
+                                                    w["bbox"][1] + w["bbox"][3]/2.0)
             cell_area = tile_bb[2] * tile_bb[3]
             token_area = w["bbox"][2] * w["bbox"][3]
             large_bubble = token_area >= CONFIG["LARGE_BUBBLE_AREA_FRAC"] * cell_area
