@@ -64,6 +64,7 @@ CONFIG = {
     "CPU_THREADS": 0,
     "WHISPER_WORKERS": 2,
 
+    # Video sampling
     "FPS_SAMPLE": 3.0,
     "VIDEO_WORKERS": 4,
 
@@ -71,35 +72,42 @@ CONFIG = {
     "LOWER_HSV": (85, 50, 50),
     "UPPER_HSV": (140, 255, 255),
 
-    # V3: resolution-agnostic area floor for blue edges
+    # Resolution-agnostic area floor for blue edges (fraction of full-frame area)
     "MIN_EDGE_AREA_FRAC": 0.0005,   # ~0.05% of frame
 
-    # V3: optional hue relax factor (None to disable; e.g., 0.35 to widen hue window)
+    # Optional hue relax factor (None to disable; e.g., 0.35 widens hue band)
     "RELAXED_BLUE_THRESHOLD": None,
 
     # Optional crop (x, y, w, h) to limit detection region (leave None for full frame)
     "VIDEO_CROP": None,
+
+    # Optional perspective warp (handles curved-screen camera capture)
+    # Four points (x,y) in *video* coordinates ordered TL, TR, BR, BL.
+    "WARP_QUAD": None,  # e.g., [(130,120),(1140,120),(1140,650),(130,650)]
+    "WARP_SIZE": None,  # e.g., (1280, 720)
 
     # OCR
     "TESSERACT_CMD": None,
     "OCR_LANG": "eng",
     "OCR_ALLOWED_RE": r"[^A-Za-z0-9 .,'()@\-\[\]]",
     "OCR_MIN_LEN": 2,
-    "FUZZ_MIN_SCORE": 55,       # from V2_8_1
+    "FUZZ_MIN_SCORE": 55,
     "OCR_WORD_CONF_MIN": 40,
-    "INITIALS_CONF_MIN": 50,    # from V2_8_1
-    "BOTTOM_STRIP_FRAC": 0.58,            # bottom label band start (fraction of tile height)
-    "BOTTOM_STRIP_PAD_BOTTOM_FRAC": 0.015,# shaving a small bottom margin
-    "AUTO_LR_FROM_TOKENS": True,
-    "LR_MARGIN_FRAC": 0.02,
-    "MIN_GRID_WIDTH_FRAC": 0.62,
+    "INITIALS_CONF_MIN": 50,
+
+    # Screenshot OCR geometry — safer defaults to avoid left-shift
+    "AUTO_LR_FROM_TOKENS": False,
+    "LR_MARGIN_FRAC": 0.00,
+    "MIN_GRID_WIDTH_FRAC": 0.95,
     "AUTO_TOP_OFFSET": True,
     "TOP_OFFSET_FRAC": 0.09,
     "AUTO_TOP_MIN_FRAC": 0.10,
     "AUTO_TOP_MAX_FRAC": 0.20,
     "AUTO_TOP_EXTRA_FRAC": 0.03,
-    "GRID_INSET": 6,
-    "LARGE_BUBBLE_AREA_FRAC": 0.02,       # initials bubble heuristic
+    "BOTTOM_STRIP_FRAC": 0.55,
+    "BOTTOM_STRIP_PAD_BOTTOM_FRAC": 0.010,
+    "GRID_INSET": 3,
+    "LARGE_BUBBLE_AREA_FRAC": 0.02,
 
     # Dynamic grid
     "DYNAMIC_GRID": False,
@@ -109,6 +117,10 @@ CONFIG = {
     "FALLBACK_IF_NO_SCREENSHOT": True,
     "EXPORT_DYNAMIC_MAP": True,
     "DYNAMIC_NAME_CACHE_TTL": 150,
+
+    # Dynamic layout estimator
+    "LAYOUT_UPDATE_PERIOD": 10,   # frames between layout refreshes
+    "LAYOUT_USE_BAND": (0.60, 0.92),  # bottom band (as frac of H) to OCR for nameplates
 
     # Debug
     "DEBUG": True,
