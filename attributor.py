@@ -1078,7 +1078,6 @@ def prompt_paths_interactive(args) -> Tuple[Path, Optional[Path], Path, Path]:
     if not screenshot:
         screenshot = _prompt_path_gui("Select meeting grid screenshot (PNG/JPG) [optional]",
                                       filetypes=[("Images", "*.png *.jpg *.jpeg"), ("All", "*.*")])
-        # console prompt only if still missing and user wants to supply
         if not screenshot:
             print("[INPUT] No screenshot selected (ok). Press Enter to continue without, or paste a path to use one.")
             raw = input("> ").strip().strip('"').strip("'")
@@ -1097,24 +1096,27 @@ def prompt_paths_interactive(args) -> Tuple[Path, Optional[Path], Path, Path]:
 
 # ----------------------------- Main -----------------------------
 def main():
-    p = argparse.ArgumentParser(description="V2.9: dynamic grid + transcript-only fallback + on-frame OCR")
+    p = argparse.ArgumentParser(description="V3: mask-per-tile scoring + hue relax + segment voting")
     p.add_argument("--interactive", action="store_true")
     p.add_argument("--video", type=Path)
-    p.add_argument("--screenshot", type=Path)  # optional in V2_9
+    p.add_argument("--screenshot", type=Path)  # optional
     p.add_argument("--ics", type=Path)
     p.add_argument("--outdir", type=Path)
-    p.add_argument("--dynamic-grid", action="store_true", help="[V2_9] enable dynamic grid mode")
+    p.add_argument("--dynamic-grid", action="store_true", help="Enable dynamic grid mode")
+    p.add_argument("--relaxed-blue-threshold", type=float, default=None, help="Widen HSV hue band by this factor (e.g., 0.35)")
     args = p.parse_args()
 
-    # --- Toggle dynamic grid without CLI ---
+    # Toggle dynamic grid via ENV, and set relax factor
     env_val = os.getenv("ATTRIB_DYNAMIC_GRID")
     if env_val is not None:
         CONFIG["DYNAMIC_GRID"] = env_val.strip().lower() in ("1", "true", "yes", "on")
 
+    if args.relaxed_blue_threshold is not None:
+        CONFIG["RELAXED_BLUE_THRESHOLD"] = float(args.relaxed_blue_threshold)
+
     if args.interactive or not args.video or not args.ics or not args.outdir:
         args.video, args.screenshot, args.ics, args.outdir = prompt_paths_interactive(args)
 
-    # Apply CLI override
     if args.dynamic_grid:
         CONFIG["DYNAMIC_GRID"] = True
 
@@ -1134,7 +1136,7 @@ def main():
     tiles = []
     shot_size = None
 
-    # OCR -> tiles when screenshot present
+    # OCR → tiles (if screenshot provided)
     if args.screenshot and Path(args.screenshot).exists():
         try:
             kept, shot_size, top_off = ocr_to_tiles(args.screenshot, name_to_company, email_to_name, initials_map, outdir=outdir)
@@ -1165,7 +1167,7 @@ def main():
     if tiles and shot_size:
         tiles_scaled = scale_tiles_to_frame(tiles, shot_size, dst_size)
 
-    # Audio -> STT
+    # Audio → STT
     wav_path = outdir / "audio_16k.wav"
     run_ffmpeg_extract_audio(args.video, wav_path)
     stt_segments, used = safe_transcribe(wav_path, language=CONFIG["LANGUAGE"])
@@ -1193,8 +1195,7 @@ def main():
 
     # Attribute & outputs
     if use_dynamic and not timeline and CONFIG["FALLBACK_IF_NO_SCREENSHOT"]:
-        # [V2_9] ultimate fallback: transcript-only placeholder
-        print("[ATTRIB] Dynamic/static detection yielded no events; using transcript-only mode.")
+        print("[ATTRIB] No events; using transcript-only mode.")
         segments = attribute_segments_transcript_only(stt_segments, CONFIG["TRANSCRIPT_ONLY_PLACEHOLDER"])
     else:
         segments = attribute_segments(stt_segments, timeline, name_to_company)
@@ -1211,7 +1212,7 @@ def main():
     write_qa_report(segments, timeline, qa_path)
 
     if len(timeline) == 0:
-        print("[DIAG] No blue-border speaker windows found. Adjust HSV or enable --dynamic-grid or set VIDEO_CROP.")
+        print("[DIAG] No blue-border events. Try adjusting HSV or --relaxed-blue-threshold, or set VIDEO_CROP.")
 
     print(json.dumps({
         "status": "ok",
