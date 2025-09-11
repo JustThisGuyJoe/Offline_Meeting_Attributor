@@ -686,19 +686,13 @@ def apply_vocab_rules(text: str) -> str:
     return out
 
 def map_tile_to_attendee_name(tile_name: str, attendees: Dict[str, str]) -> str:
-    """
-    [V2_9_2] Avoid collapsing different people with the same short label.
-    If the tile text is generic (single token or very short), require higher confidence.
-    """
     if not attendees:
         return tile_name
     choices = list(attendees.keys())
     if not choices:
         return tile_name
-
     generic = len(tile_name.split()) <= 1 or len(tile_name) <= 6
     thresh = 80 if generic else 70
-
     best = rf_process.extractOne(tile_name, choices, scorer=fuzz.WRatio)
     if best and best[1] >= thresh:
         return best[0]
@@ -710,6 +704,7 @@ def overlap(a, b):
     return max(0.0, e - s)
 
 def attribute_segments(segments: List[Dict], timeline: List[SpeakerEvent], attendees: Dict[str, str]) -> List['TranscriptSegment']:
+    """V3: vote by accumulated active duration inside a padded window per segment."""
     if not segments: return []
     events = sorted(timeline, key=lambda e: e.start)
     out: List[TranscriptSegment] = []
