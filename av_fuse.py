@@ -79,13 +79,44 @@ try:
 except Exception:
     WhisperModel = None
 
-def eprint(*args, **kwargs):
-    print(*args, file=sys.stderr, **kwargs)
+# ==========================
+# CONFIG (edit as needed)
+# ==========================
+CONFIG = {
+    # Leave as None to trigger GUI file pickers
+    "VISUAL_VIDEO": None,  # Zoom screen-record (visual only)
+    "AUDIO_SOURCE": None,  # Phone video/audio (with audio) OR audio file
+    "ICS_FILE": None,      # .ics invite
+    "WORK_DIR": None,      # Folder to hold out\ and temp\ (GUI will prompt if None)
+
+    # STT / model
+    "WHISPER_MODEL": "medium",
+    "WHISPER_DEVICE": "cuda",      # "cuda" or "cpu"
+    "WHISPER_COMPUTE": "float16",  # "float16", "int8", ...
+
+    # Visual detection
+    "FPS_SAMPLE": 2.0,      # frames/sec to sample for border detection
+    "OCR_ENABLED": True,    # False to disable OCR of bottom labels
+}
+
+USE_GUI_DEFAULT = True  # set to False to rely solely on CONFIG (and run with --nogui if desired)
+
+# ==========================
+# Logging utilities
+# ==========================
+def log(msg: str):
+    print(msg, flush=True)
+
+def elog(msg: str):
+    print(msg, file=sys.stderr, flush=True)
 
 def run(cmd: List[str], check=True) -> subprocess.CompletedProcess:
-    eprint(">", " ".join(cmd))
+    elog("> " + " ".join(cmd))
     return subprocess.run(cmd, check=check, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
+# ==========================
+# Helpers
+# ==========================
 def is_audio_file(path: Path) -> bool:
     return path.suffix.lower() in {".wav", ".m4a", ".mp3", ".aac", ".flac", ".ogg", ".opus"}
 
@@ -156,16 +187,18 @@ class STTSegment:
     end: float
     text: str
 
-def transcribe_wav_fwhisper(wav_path: Path, model_size: str = "medium", device: str = "cuda", compute_type: str = "float16") -> List[STTSegment]:
+def transcribe_wav_fwhisper(wav_path: Path, model_size: str, device: str, compute_type: str) -> List[STTSegment]:
     if WhisperModel is None:
         raise ImportError("faster-whisper is not installed. pip install faster-whisper")
-    eprint(f"[STT] Loading Whisper model: {model_size} ({device}/{compute_type})")
+    log(f"[STT] Loading Whisper model: {model_size} ({device}/{compute_type})")
     model = WhisperModel(model_size, device=device, compute_type=compute_type)
     segments: List[STTSegment] = []
-    options = dict(beam_size=5, vad_filter=True, vad_parameters=dict(min_silence_duration_ms=500))
-    for seg in model.transcribe(str(wav_path), **options)[0]:
+    opts = dict(beam_size=5, vad_filter=True, vad_parameters=dict(min_silence_duration_ms=500))
+    t0 = time.time()
+    it, _info = model.transcribe(str(wav_path), **opts)
+    for seg in it:
         segments.append(STTSegment(start=float(seg.start), end=float(seg.end), text=seg.text.strip()))
-    eprint(f"[STT] Segments: {len(segments)}")
+    log(f"[STT] Done. Segments: {len(segments)} in {time.time()-t0:.1f}s")
     return segments
 
 @dataclass
