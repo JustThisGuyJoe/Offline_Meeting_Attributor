@@ -658,15 +658,15 @@ def main(argv=None):
         attributed.append((name, seg.start, seg.end, seg.text))
 
     attributed = merge_consecutive_segments(attributed)
-    lines = format_transcript_lines(attributed)
+    final_lines = format_transcript_lines(attributed)
 
-    # Success write
+    # Overwrite with SUCCESS (upgraded from provisional)
     write_outputs(
         vis_path, aud_src, ics_path, out_dir, temp_dir,
-        lines, attendees, identities, best_offset,
+        final_lines, attendees, identities, best_offset,
         len(stt_segments), grid_info, status="success"
     )
-    log(f"[DONE] Attributed lines: {len(lines)}")
+    log(f"[DONE] Attributed lines: {len(final_lines)}")
     close_log()
     return 0
 
