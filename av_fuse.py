@@ -251,14 +251,12 @@ def detect_highlight_series(video_path: Path, fps_sample: float, do_ocr: bool) -
                 f_idx += 1
                 continue
             mask_blue = hsv_blue_mask(frame)
-            scores = []
-            for i, m in enumerate(masks):
-                s = int(cv2.countNonZero(cv2.bitwise_and(mask_blue, m)))
-                scores.append(s)
+            scores = [int(cv2.countNonZero(cv2.bitwise_and(mask_blue, m))) for m in masks]
             tile_idx = int(np.argmax(scores))
             t = f_idx / v_fps
             events.append(TileEvent(t=t, tile_idx=tile_idx))
-            if ocr and pytesseract is not None:
+
+            if do_ocr and pytesseract is not None:
                 (x0,y0,x1,y1) = rois[tile_idx]
                 band = frame[y0:y1, x0:x1]
                 band = cv2.resize(band, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
