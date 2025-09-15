@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
-# av_fuse.py  — V1.0.3
+# av_fuse.py  — V1.0.4
 #
-# What’s new vs V1.0.2:
-# - ALWAYS writes outputs. If visual attribution fails, it still writes a STT-only transcript
-#   (lines prefixed with "Unknown:") and diagnostics with status="stt_only".
-# - Logs to console AND to a run log file: <Working>\out\<visual_basename>_run.log
-# - Prints explicit file paths and stage markers. Preflight checks the visual file and first frame.
-# - GUI pickers for Visual, Audio, ICS, and Working Folder (creates <Work>\out and <Work>\temp).
-# - Minimal CLI (you can set CONFIG paths and run with --nogui).
+# Changes vs V1.0.3:
+# - Writes a *provisional* STT-only transcript immediately after STT (status="stt_only_provisional"),
+#   then upgrades to full attribution (status="success") if visual detection completes.
+# - Skips re-FFmpeg if the audio source is already mono/16k WAV.
+# - Extra prints around the handoff from STT → Visual so we can see the exact point of failure.
 #
 from __future__ import annotations
 
