@@ -27,17 +27,16 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import cv2
 
+# Optional deps; script degrades gracefully if missing.
 try:
     import pytesseract
 except Exception:
     pytesseract = None
-
 try:
     from rapidfuzz import process, fuzz
 except Exception:
     process = None
     fuzz = None
-
 try:
     from faster_whisper import WhisperModel
 except Exception:
@@ -47,11 +46,11 @@ except Exception:
 # CONFIG (edit as needed)
 # ==========================
 CONFIG = {
-    # Leave as None to trigger GUI file pickers
+    # Leave as None to trigger GUI pickers
     "VISUAL_VIDEO": None,  # Zoom screen-record (visual only)
     "AUDIO_SOURCE": None,  # Phone video/audio (with audio) OR audio file
     "ICS_FILE": None,      # .ics invite
-    "WORK_DIR": None,      # Folder to hold out\ and temp\ (GUI will prompt if None)
+    "WORK_DIR": None,      # Folder to hold out\ and temp\ (GUI prompts if None)
 
     # STT / model
     "WHISPER_MODEL": "medium",
@@ -61,18 +60,55 @@ CONFIG = {
     # Visual detection
     "FPS_SAMPLE": 2.0,      # frames/sec to sample for border detection
     "OCR_ENABLED": True,    # False to disable OCR of bottom labels
+
+    # Debug extras
+    "DEBUG_SNAPSHOTS": False,   # if True, saves a few sampled frames to temp\
+    "SNAPSHOT_EVERY": 150,      # snapshot every N sampled frames (if enabled)
 }
 
-USE_GUI_DEFAULT = True  # set to False to rely solely on CONFIG (and run with --nogui if desired)
+USE_GUI_DEFAULT = True  # set False to rely solely on CONFIG (and run with --nogui)
 
 # ==========================
 # Logging utilities
 # ==========================
+_log_file_handle = None
+
+def _open_log_file(path: Path):
+    global _log_file_handle
+    try:
+        _log_file_handle = path.open("a", encoding="utf-8")
+        _log_file_handle.write(f"===== RUN START {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
+        _log_file_handle.flush()
+    except Exception:
+        _log_file_handle = None
+
+def _write_log_file(msg: str):
+    global _log_file_handle
+    if _log_file_handle:
+        try:
+            _log_file_handle.write(msg + "\n")
+            _log_file_handle.flush()
+        except Exception:
+            pass
+
 def log(msg: str):
     print(msg, flush=True)
+    _write_log_file(msg)
 
 def elog(msg: str):
     print(msg, file=sys.stderr, flush=True)
+    _write_log_file("[ERR] " + msg)
+
+def close_log():
+    global _log_file_handle
+    if _log_file_handle:
+        try:
+            _log_file_handle.write(f"===== RUN END {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
+            _log_file_handle.flush()
+            _log_file_handle.close()
+        except Exception:
+            pass
+        _log_file_handle = None
 
 def run(cmd: List[str], check=True) -> subprocess.CompletedProcess:
     elog("> " + " ".join(cmd))
