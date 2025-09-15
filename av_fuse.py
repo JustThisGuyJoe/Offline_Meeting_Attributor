@@ -118,7 +118,7 @@ def parse_ics_attendees(ics_path: Path) -> List[Attendee]:
 def best_icsonym_match(raw: str, icsonyms: List[str]) -> Optional[str]:
     if not raw:
         return None
-    s = re.sub(r"[^A-Za-z0-9@.\\-' ]+", "", raw).strip()
+    s = re.sub(r"[^A-Za-z0-9@\.\-\' ]+", "", raw).strip()
     if not s:
         return None
     if not icsonyms:
