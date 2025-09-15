@@ -347,18 +347,6 @@ def map_identities_to_ics(identities: Dict[int, TileIdentity], attendees: List[A
         identities[idx] = TileIdentity(idx=idx, label_raw=ident.label_raw, name_mapped=mapped or ident.label_raw)
     return identities
 
-def build_tile_lookup(events: List[TileEvent]) -> Tuple[np.ndarray, np.ndarray]:
-    times = np.array([ev.t for ev in events], dtype=np.float32)
-    tiles = np.array([ev.tile_idx for ev in events], dtype=np.int16)
-    return times, tiles
-
-def tile_at_time(times: np.ndarray, tiles: np.ndarray, t: float) -> Optional[int]:
-    if times.size == 0:
-        return None
-    idx = np.searchsorted(times, t, side="right") - 1
-    idx = np.clip(idx, 0, len(times)-1)
-    return int(tiles[idx])
-
 def merge_consecutive_segments(attributed: List[Tuple[str, float, float, str]]) -> List[Tuple[str, float, float, str]]:
     if not attributed:
         return []
