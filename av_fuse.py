@@ -134,13 +134,12 @@ def best_icsonym_match(raw: str, icsonyms: List[str]) -> Optional[str]:
                 return can
         return s
 
-def extract_audio_to_wav(src: Path, out_dir: Path, sr: int = 16000) -> Path:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_wav = out_dir / (src.stem + "_audio16k.wav")
+def extract_audio_to_wav(src: Path, out_wav: Path, sr: int = 16000) -> Path:
+    out_wav.parent.mkdir(parents=True, exist_ok=True)
     cmd = ["ffmpeg", "-y", "-i", str(src), "-vn", "-ac", "1", "-ar", str(sr), "-f", "wav", str(out_wav)]
     proc = run(cmd, check=True)
     if proc.returncode != 0:
-        eprint(proc.stderr)
+        elog(proc.stderr)
         raise RuntimeError("ffmpeg failed to extract audio.")
     return out_wav
 
@@ -324,11 +323,11 @@ def refine_offset_grid(events: List[TileEvent], stt: List[STTSegment], initial_o
             idx = min(n-1, int(round(t/0.25)))
             arr[idx] = 1
         return arr
+
     vis_bins = bin_times(change_times)
     best_off = initial_offset
     best_score = -1.0
-    offs = np.arange(initial_offset - search_window, initial_offset + search_window + 1e-9, step)
-    for off in offs:
+    for off in np.arange(initial_offset - search_window, initial_offset + search_window + 1e-9, step):
         shifted = [t + off for t in seg_starts]
         stt_bins = bin_times(shifted)
         M = max(len(vis_bins), len(stt_bins))
@@ -340,7 +339,7 @@ def refine_offset_grid(events: List[TileEvent], stt: List[STTSegment], initial_o
         if score > best_score:
             best_score = score
             best_off = float(off)
-    eprint(f"[Align] initial={initial_offset:.2f}s refined={best_off:.2f}s score={best_score:.3f}")
+    log(f"[Align] initial={initial_offset:.2f}s refined={best_off:.2f}s score={best_score:.3f}")
     return best_off
 
 def map_identities_to_ics(identities: Dict[int, TileIdentity], attendees: List[Attendee]) -> Dict[int, TileIdentity]:
