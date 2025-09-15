@@ -1,23 +1,17 @@
 #!/usr/bin/env python3
-# av_fuse.py  — V1.0.4
+# av_fuse.py  — V1.0.5
 #
-# Changes vs V1.0.3:
-# - Writes a *provisional* STT-only transcript immediately after STT (status="stt_only_provisional"),
-#   then upgrades to full attribution (status="success") if visual detection completes.
-# - Skips re-FFmpeg if the audio source is already mono/16k WAV.
-# - Extra prints around the handoff from STT → Visual so we can see the exact point of failure.
+# Changes vs V1.0.4:
+# - Writes provisional STT-only transcript + diagnostics immediately after STT,
+#   then upgrades them on success.
+# - Registers an atexit emergency writer to dump STT-only outputs if the process
+#   terminates after STT but before we’ve written files.
+# - Visual preflight tries CAP_ANY and CAP_FFMPEG.
+# - Extra prints between STT and Visual steps.
 #
 from __future__ import annotations
 
-import argparse
-import json
-import math
-import os
-import re
-import subprocess
-import sys
-import time
-import traceback
+import argparse, atexit, json, math, os, re, subprocess, sys, time, traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -44,24 +38,20 @@ except Exception:
 # CONFIG (edit as needed)
 # ==========================
 CONFIG = {
-    # Leave as None to trigger GUI pickers
     "VISUAL_VIDEO": None,  # Zoom screen-record (visual only)
-    "AUDIO_SOURCE": None,  # Phone video/audio (with audio) OR audio file
+    "AUDIO_SOURCE": None,  # Phone video/audio with audio OR audio file
     "ICS_FILE": None,      # .ics invite
     "WORK_DIR": None,      # Folder to hold out\ and temp\ (GUI prompts if None)
 
-    # STT / model
     "WHISPER_MODEL": "medium",
     "WHISPER_DEVICE": "cuda",      # "cuda" or "cpu"
     "WHISPER_COMPUTE": "float16",  # "float16", "int8", ...
 
-    # Visual detection
-    "FPS_SAMPLE": 2.0,      # frames/sec to sample for border detection
-    "OCR_ENABLED": True,    # False to disable OCR of bottom labels
+    "FPS_SAMPLE": 2.0,
+    "OCR_ENABLED": True,
 
-    # Debug extras
-    "DEBUG_SNAPSHOTS": False,   # if True, saves a few sampled frames to temp\
-    "SNAPSHOT_EVERY": 150,      # snapshot every N sampled frames (if enabled)
+    "DEBUG_SNAPSHOTS": False,
+    "SNAPSHOT_EVERY": 150,
 }
 
 USE_GUI_DEFAULT = True  # set False to rely solely on CONFIG (and run with --nogui)
@@ -70,7 +60,6 @@ USE_GUI_DEFAULT = True  # set False to rely solely on CONFIG (and run with --nog
 # Logging utilities
 # ==========================
 _log_file_handle = None
-
 def _open_log_file(path: Path):
     global _log_file_handle
     try:
@@ -124,16 +113,13 @@ def is_video_file(path: Path) -> bool:
 def is_mono_16k_wav(path: Path) -> bool:
     if path.suffix.lower() != ".wav":
         return False
-    # Heuristic shortcut: if name already includes 'audio16k', assume it's good
     if "audio16k" in path.stem.lower():
         return True
-    # Quick probe via ffprobe (best effort; if it fails, fallback to False)
     try:
         cmd = ["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries",
                "stream=sample_rate,channels", "-of", "default=nw=1:nk=1", str(path)]
         proc = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         vals = [v.strip() for v in proc.stdout.splitlines() if v.strip()]
-        # Expect two lines: sample_rate then channels
         if len(vals) >= 2:
             sr = int(vals[0]); ch = int(vals[1])
             return (sr == 16000 and ch == 1)
@@ -269,6 +255,17 @@ def tile_bottom_label_roi(h: int, w: int, rows: int, cols: int, band_fraction: f
             rois.append((x0,y0,x1,y1))
     return rois
 
+def _open_video_with_backoffs(path: Path):
+    # Try default backend
+    cap = cv2.VideoCapture(str(path))
+    if cap.isOpened():
+        return cap
+    # Try FFMPEG explicitly
+    cap2 = cv2.VideoCapture(str(path), cv2.CAP_FFMPEG)
+    if cap2.isOpened():
+        return cap2
+    return None
+
 def detect_highlight_series(
     video_path: Path,
     fps_sample: float,
@@ -278,26 +275,23 @@ def detect_highlight_series(
     temp_dir: Path
 ) -> Tuple[List[TileEvent], Dict[int, TileIdentity], Tuple[int,int]]:
     log(f"[Visual] Starting analysis for: {video_path}")
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        raise RuntimeError(f"Could not open video: {video_path}")
+    cap = _open_video_with_backoffs(video_path)
+    if cap is None or not cap.isOpened():
+        raise RuntimeError(f"Could not open video (CAP_ANY/FFMPEG both failed): {video_path}")
     ok, probe = cap.read()
     if not ok or probe is None:
         cap.release()
         raise RuntimeError(f"Video opened but first frame read failed: {video_path}")
     v_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    v_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    v_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    v_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); v_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     log(f"[Visual] Resolution: {v_w}x{v_h}, FPS: {v_fps:.2f}, Frames: {total_frames}")
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
     step = max(1, int(round(v_fps / max(0.1, fps_sample))))
     grids = choose_grids()
-    best_grid = None
-    best_score = -1.0
-    best_events = None
-    best_labels = None
+    best_grid = None; best_score = -1.0
+    best_events = None; best_labels = None
 
     for (R,C) in grids:
         log(f"[Visual] Trying grid {R}x{C}")
@@ -305,19 +299,15 @@ def detect_highlight_series(
         rois = tile_bottom_label_roi(v_h, v_w, R, C, band_fraction=0.20)
         events: List[TileEvent] = []
         label_samples = {i: [] for i in range(R*C)}
-
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-        processed = 0
-        t0 = time.time()
-        f_idx = 0
-        snap_count = 0
+        processed = 0; t0 = time.time(); f_idx = 0; snap_count = 0
+
         while True:
             ok, frame = cap.read()
             if not ok:
                 break
             if f_idx % step != 0:
-                f_idx += 1
-                continue
+                f_idx += 1; continue
             mask_blue = hsv_blue_mask(frame)
             scores = [int(cv2.countNonZero(cv2.bitwise_and(mask_blue, m))) for m in masks]
             tile_idx = int(np.argmax(scores))
@@ -338,13 +328,10 @@ def detect_highlight_series(
             if debug_snapshots and (processed % max(1, snapshot_every) == 0):
                 snap_path = temp_dir / f"debug_frame_{R}x{C}_{snap_count:04d}.jpg"
                 try:
-                    cv2.imwrite(str(snap_path), frame)
-                    snap_count += 1
-                except Exception:
-                    pass
+                    cv2.imwrite(str(snap_path), frame); snap_count += 1
+                except Exception: pass
 
-            f_idx += 1
-            processed += 1
+            f_idx += 1; processed += 1
             if processed % 50 == 0:
                 log(f"[Visual] Grid {R}x{C}: sampled {processed} frames...")
 
@@ -352,29 +339,21 @@ def detect_highlight_series(
         stability = same_runs / max(1, len(events))
         log(f"[Visual] Grid {R}x{C} stability={stability:.3f} (samples={len(events)}) in {time.time()-t0:.1f}s")
         if stability > best_score:
-            best_score = stability
-            best_grid = (R, C)
-            best_events = events
-            best_labels = label_samples
+            best_score = stability; best_grid = (R, C)
+            best_events = events; best_labels = label_samples
 
     identities: Dict[int, TileIdentity] = {}
     R, C = best_grid
     for idx in range(R*C):
         samples = best_labels.get(idx, [])
-        if not samples:
-            raw = ""
-        else:
-            values, counts = np.unique(np.array(samples), return_counts=True)
-            raw = str(values[np.argmax(counts)])
+        raw = "" if not samples else str(np.unique(np.array(samples), return_counts=True)[0][np.argmax(np.unique(np.array(samples), return_counts=True)[1])])
         identities[idx] = TileIdentity(idx=idx, label_raw=raw, name_mapped="")
-
     cap.release()
     log(f"[Visual] Selected grid: {R}x{C} (stability={best_score:.3f})")
     return best_events, identities, best_grid
 
 def first_stable_highlight_time(events: List[TileEvent], stable_len: int = 3) -> Optional[float]:
-    if not events:
-        return None
+    if not events: return None
     for i in range(len(events) - stable_len + 1):
         tid = events[i].tile_idx
         if all(events[i+j].tile_idx == tid for j in range(1, stable_len)):
@@ -388,31 +367,24 @@ def refine_offset_grid(events: List[TileEvent], stt: List[STTSegment], initial_o
         return initial_offset
 
     def bin_times(times: List[float]) -> np.ndarray:
-        if not times:
-            return np.zeros(1, dtype=int)
-        tmax = max(times) + 1.0
-        n = int(math.ceil(tmax / 0.25))
+        if not times: return np.zeros(1, dtype=int)
+        tmax = max(times) + 1.0; n = int(math.ceil(tmax / 0.25))
         arr = np.zeros(n, dtype=int)
         for t in times:
-            idx = min(n-1, int(round(t/0.25)))
-            arr[idx] = 1
+            idx = min(n-1, int(round(t/0.25))); arr[idx] = 1
         return arr
 
     vis_bins = bin_times(change_times)
-    best_off = initial_offset
-    best_score = -1.0
+    best_off = initial_offset; best_score = -1.0
     for off in np.arange(initial_offset - search_window, initial_offset + search_window + 1e-9, step):
         shifted = [t + off for t in seg_starts]
         stt_bins = bin_times(shifted)
         M = max(len(vis_bins), len(stt_bins))
-        vb = np.pad(vis_bins, (0, M - len(vis_bins)))
-        sb = np.pad(stt_bins, (0, M - len(stt_bins)))
-        inter = np.sum((vb==1) & (sb==1))
-        union = np.sum((vb==1) | (sb==1)) + 1e-6
+        vb = np.pad(vis_bins, (0, M - len(vis_bins))); sb = np.pad(stt_bins, (0, M - len(stt_bins)))
+        inter = np.sum((vb==1) & (sb==1)); union = np.sum((vb==1) | (sb==1)) + 1e-6
         score = inter / union
         if score > best_score:
-            best_score = score
-            best_off = float(off)
+            best_score = score; best_off = float(off)
     log(f"[Align] initial={initial_offset:.2f}s refined={best_off:.2f}s score={best_score:.3f}")
     return best_off
 
@@ -424,13 +396,12 @@ def map_identities_to_ics(identities: Dict[int, TileIdentity], attendees: List[A
     return identities
 
 def merge_consecutive_segments(attributed: List[Tuple[str, float, float, str]]) -> List[Tuple[str, float, float, str]]:
-    if not attributed:
-        return []
+    if not attributed: return []
     merged = [attributed[0]]
     for name, s, e, text in attributed[1:]:
-        prev_name, ps, pe, ptext = merged[-1]
-        if name == prev_name and abs(s - pe) < 0.75:
-            merged[-1] = (prev_name, ps, e, (ptext + " " + text).strip())
+        pn, ps, pe, pt = merged[-1]
+        if name == pn and abs(s - pe) < 0.75:
+            merged[-1] = (pn, ps, e, (pt + " " + text).strip())
         else:
             merged.append((name, s, e, text))
     return merged
@@ -439,17 +410,14 @@ def format_transcript_lines(attributed: List[Tuple[str, float, float, str]]) -> 
     return [f"{(name or 'Unknown')}: {text}" for name, s, e, text in attributed]
 
 def ensure_work_dirs(base: Path) -> Tuple[Path, Path]:
-    out_dir = base / "out"
-    temp_dir = base / "temp"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    temp_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = base / "out"; temp_dir = base / "temp"
+    out_dir.mkdir(parents=True, exist_ok=True); temp_dir.mkdir(parents=True, exist_ok=True)
     return out_dir, temp_dir
 
 def pick_inputs_with_gui(cfg: dict) -> dict:
     import tkinter as tk
     from tkinter import filedialog
-    root = tk.Tk()
-    root.withdraw()
+    root = tk.Tk(); root.withdraw()
     if cfg["VISUAL_VIDEO"] is None:
         cfg["VISUAL_VIDEO"] = Path(filedialog.askopenfilename(title="Select Zoom screen recording (visual only)",
                                                               filetypes=[("Video", "*.mp4 *.mov *.mkv *.avi *.webm")]))
@@ -461,8 +429,7 @@ def pick_inputs_with_gui(cfg: dict) -> dict:
                                                           filetypes=[("iCalendar", "*.ics")]))
     if cfg["WORK_DIR"] is None:
         cfg["WORK_DIR"] = Path(filedialog.askdirectory(title="Select Working Folder (will create out/ and temp/)"))
-    root.destroy()
-    return cfg
+    root.destroy(); return cfg
 
 def write_outputs(
     vis_path: Path,
@@ -482,13 +449,11 @@ def write_outputs(
     out_txt = out_dir / f"{base}_attributed_transcript.txt"
     out_json = out_dir / f"{base}_diagnostics.json"
     out_txt.write_text("\n".join(lines), encoding="utf-8")
-
     diag = {
         "status": status,  # "stt_only_provisional" | "stt_only" | "success"
         "visual_video": str(vis_path),
         "audio_source": str(aud_src),
         "ics": str(ics_path) if ics_path else "",
-        "events_samples": None if grid_info is None else "see grid",
         "attendees": [a.__dict__ for a in attendees],
         "identities": {k: identities[k].__dict__ for k in identities} if identities else {},
         "offset_seconds": float(best_offset),
@@ -501,24 +466,48 @@ def write_outputs(
     log(f"[OUT] Diagnostics: {out_json}")
     return out_txt, out_json
 
+# ===== atexit emergency writer =====
+_emergency = {
+    "enabled": False,
+    "vis_path": None,
+    "aud_src": None,
+    "ics_path": None,
+    "out_dir": None,
+    "temp_dir": None,
+    "attendees": [],
+    "stt_segments": None,  # List[STTSegment]
+}
+
+def _atexit_emergency_writer():
+    try:
+        if not _emergency["enabled"]:
+            return
+        vis_path = _emergency["vis_path"]; out_dir = _emergency["out_dir"]; temp_dir = _emergency["temp_dir"]
+        aud_src  = _emergency["aud_src"];  ics_path = _emergency["ics_path"]; attendees = _emergency["attendees"]
+        stt_segments = _emergency["stt_segments"]
+        if not (vis_path and out_dir and stt_segments):
+            return
+        lines = [f"Unknown: {s.text}" for s in stt_segments]
+        write_outputs(vis_path, aud_src, ics_path, out_dir, temp_dir, lines, attendees, {}, 0.0, len(stt_segments), None, status="stt_only")
+        log("[atexit] Wrote emergency STT-only outputs.")
+    except Exception as ex:
+        elog("[atexit] Emergency write failed: " + str(ex))
+
+atexit.register(_atexit_emergency_writer)
+
 def ensure_audio_ready(aud_src: Path, temp_dir: Path) -> Path:
-    """Return a mono/16k WAV path for STT, skipping re-FFmpeg if already suitable."""
     if is_mono_16k_wav(aud_src):
-        # Copy into temp to keep everything in the work folder
         target = temp_dir / aud_src.name
         if str(target).lower() != str(aud_src).lower():
             try:
                 target.write_bytes(aud_src.read_bytes())
                 log(f"[Audio] Using existing mono/16k WAV (copied to temp): {target}")
             except Exception:
-                # If copy fails, just point to original
                 target = aud_src
                 log(f"[Audio] Using existing mono/16k WAV (original): {target}")
         else:
             log(f"[Audio] Using existing mono/16k WAV: {target}")
         return target
-
-    # Otherwise convert/normalize
     out_wav = temp_dir / (aud_src.stem + "_audio16k.wav")
     log(f"[Audio] Extracting/normalizing to WAV: {out_wav}")
     t0 = time.time()
@@ -527,14 +516,12 @@ def ensure_audio_ready(aud_src: Path, temp_dir: Path) -> Path:
     return out
 
 def main(argv=None):
-    # Optional flag: --nogui to skip GUI even if USE_GUI_DEFAULT is True
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--nogui", action="store_true")
     args, _ = parser.parse_known_args(argv)
 
     cfg = dict(CONFIG)
-    use_gui = USE_GUI_DEFAULT and not args.nogui
-    if use_gui:
+    if (USE_GUI_DEFAULT and not args.nogui):
         cfg = pick_inputs_with_gui(cfg)
 
     vis_path = Path(cfg["VISUAL_VIDEO"]) if cfg["VISUAL_VIDEO"] else None
@@ -554,7 +541,6 @@ def main(argv=None):
         raise FileNotFoundError("Missing WORK_DIR. Set CONFIG['WORK_DIR'] or use GUI.")
 
     out_dir, temp_dir = ensure_work_dirs(work_dir)
-    # open a run log inside out\
     run_log_path = out_dir / (vis_path.stem + "_run.log")
     _open_log_file(run_log_path)
 
@@ -582,34 +568,34 @@ def main(argv=None):
     if not stt_segments:
         log("[STT] No segments produced—writing empty transcript and exiting.")
         write_outputs(vis_path, aud_src, ics_path, out_dir, temp_dir, [], attendees, {}, 0.0, 0, None, status="stt_only")
-        close_log()
-        return 2
+        close_log(); return 2
 
-    # === PROVISIONAL WRITE (so you always have a transcript even if the visual step exits) ===
+    # Enable atexit emergency writer now that we have STT
+    _emergency.update({
+        "enabled": True, "vis_path": vis_path, "aud_src": aud_src, "ics_path": ics_path,
+        "out_dir": out_dir, "temp_dir": temp_dir, "attendees": attendees, "stt_segments": stt_segments,
+    })
+
+    # === PROVISIONAL WRITE after STT ===
     provisional_lines = [f"Unknown: {s.text}" for s in stt_segments]
     write_outputs(vis_path, aud_src, ics_path, out_dir, temp_dir, provisional_lines,
                   attendees, {}, 0.0, len(stt_segments), None, status="stt_only_provisional")
-    log("[Checkpoint] Provisional STT-only transcript written. Moving to visual detection...")
+    log("[Checkpoint] Provisional STT-only transcript+diagnostics written. Proceeding to visual...")
 
-    # VISUAL Preflight
+    # VISUAL Preflight with backoffs
     log("[Visual] Preflight: opening video...")
-    test_cap = cv2.VideoCapture(str(vis_path))
-    if not test_cap.isOpened():
-        log(f"[Visual][ERROR] Cannot open video: {vis_path}")
-        close_log()
-        return 4
+    test_cap = _open_video_with_backoffs(vis_path)
+    if test_cap is None or not test_cap.isOpened():
+        log(f"[Visual][ERROR] Cannot open video with CAP_ANY/FFMPEG: {vis_path}")
+        close_log(); return 4
     ok, frm0 = test_cap.read()
     test_cap.release()
     if not ok or frm0 is None:
         log(f"[Visual][ERROR] Opened but first frame read failed: {vis_path}")
-        close_log()
-        return 5
+        close_log(); return 5
     log("[Visual] Preflight OK; starting detection...")
 
     # VISUAL Detection
-    identities: Dict[int, TileIdentity] = {}
-    events: List[TileEvent] = []
-    grid_info: Optional[Tuple[int,int]] = None
     try:
         events, identities, grid_info = detect_highlight_series(
             vis_path,
@@ -622,13 +608,11 @@ def main(argv=None):
     except Exception as ex:
         elog("[Visual][FATAL] Exception in detection: " + str(ex))
         traceback.print_exc()
-        close_log()
-        return 6
+        close_log(); return 6
 
     if not events:
         log("[Visual] No highlight events detected—keeping STT-only transcript.")
-        close_log()
-        return 3
+        close_log(); return 3
 
     R, C = grid_info
     log(f"[Visual] Events: {len(events)}, Grid: {R}x{C}")
@@ -638,15 +622,14 @@ def main(argv=None):
 
     # Offset estimate + refine
     t_vis0 = first_stable_highlight_time(events) or 0.0
-    t_aud0 = stt_segments[0].start if stt_segments else 0.0
+    t_aud0 = stt_segments[0].start
     initial = t_vis0 - t_aud0
     log(f"[Align] Initial guess offset = visual({t_vis0:.2f}) - audio({t_aud0:.2f}) = {initial:.2f}s")
     best_offset = refine_offset_grid(events, stt_segments, initial_offset=initial, search_window=10.0, step=0.1)
 
-    # Attribute by nearest visual sample at seg.start + offset
+    # Attribute
     times_arr = np.array([ev.t for ev in events], dtype=np.float32)
     tiles_arr = np.array([ev.tile_idx for ev in events], dtype=np.int16)
-
     attributed: List[Tuple[str, float, float, str]] = []
     for seg in stt_segments:
         t_vis = seg.start + best_offset
@@ -657,10 +640,9 @@ def main(argv=None):
         name = (ident.name_mapped or ident.label_raw or f"Tile{tidx+1}") if ident else f"Tile{tidx+1}"
         attributed.append((name, seg.start, seg.end, seg.text))
 
+    # Merge + write final
     attributed = merge_consecutive_segments(attributed)
     final_lines = format_transcript_lines(attributed)
-
-    # Overwrite with SUCCESS (upgraded from provisional)
     write_outputs(
         vis_path, aud_src, ics_path, out_dir, temp_dir,
         final_lines, attendees, identities, best_offset,
