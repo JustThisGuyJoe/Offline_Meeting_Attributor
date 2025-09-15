@@ -585,21 +585,23 @@ def main(argv=None):
         close_log()
         return 2
 
+    # === PROVISIONAL WRITE (so you always have a transcript even if the visual step exits) ===
+    provisional_lines = [f"Unknown: {s.text}" for s in stt_segments]
+    write_outputs(vis_path, aud_src, ics_path, out_dir, temp_dir, provisional_lines,
+                  attendees, {}, 0.0, len(stt_segments), None, status="stt_only_provisional")
+    log("[Checkpoint] Provisional STT-only transcript written. Moving to visual detection...")
+
     # VISUAL Preflight
     log("[Visual] Preflight: opening video...")
     test_cap = cv2.VideoCapture(str(vis_path))
     if not test_cap.isOpened():
         log(f"[Visual][ERROR] Cannot open video: {vis_path}")
-        lines = [f"Unknown: {s.text}" for s in stt_segments]
-        write_outputs(vis_path, aud_src, ics_path, out_dir, temp_dir, lines, attendees, {}, 0.0, len(stt_segments), None, status="stt_only")
         close_log()
         return 4
     ok, frm0 = test_cap.read()
     test_cap.release()
     if not ok or frm0 is None:
         log(f"[Visual][ERROR] Opened but first frame read failed: {vis_path}")
-        lines = [f"Unknown: {s.text}" for s in stt_segments]
-        write_outputs(vis_path, aud_src, ics_path, out_dir, temp_dir, lines, attendees, {}, 0.0, len(stt_segments), None, status="stt_only")
         close_log()
         return 5
     log("[Visual] Preflight OK; starting detection...")
@@ -620,16 +622,11 @@ def main(argv=None):
     except Exception as ex:
         elog("[Visual][FATAL] Exception in detection: " + str(ex))
         traceback.print_exc()
-        # Fallback to STT-only output
-        lines = [f"Unknown: {s.text}" for s in stt_segments]
-        write_outputs(vis_path, aud_src, ics_path, out_dir, temp_dir, lines, attendees, {}, 0.0, len(stt_segments), None, status="stt_only")
         close_log()
         return 6
 
     if not events:
-        log("[Visual] No highlight events detected—writing STT-only transcript.")
-        lines = [f"Unknown: {s.text}" for s in stt_segments]
-        write_outputs(vis_path, aud_src, ics_path, out_dir, temp_dir, lines, attendees, {}, 0.0, len(stt_segments), grid_info, status="stt_only")
+        log("[Visual] No highlight events detected—keeping STT-only transcript.")
         close_log()
         return 3
 
