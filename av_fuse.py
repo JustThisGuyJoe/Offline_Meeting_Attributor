@@ -340,7 +340,7 @@ def detect_highlight_series(
                 try:
                     cv2.imwrite(str(snap_path), frame)
                     snap_count += 1
-                except Exception as _:
+                except Exception:
                     pass
 
             f_idx += 1
