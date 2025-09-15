@@ -446,6 +446,43 @@ def pick_inputs_with_gui(cfg: dict) -> dict:
     root.destroy()
     return cfg
 
+def write_outputs(
+    vis_path: Path,
+    aud_src: Path,
+    ics_path: Optional[Path],
+    out_dir: Path,
+    temp_dir: Path,
+    lines: List[str],
+    attendees: List[Attendee],
+    identities: Dict[int, TileIdentity],
+    best_offset: float,
+    stt_segments_count: int,
+    grid_info: Optional[Tuple[int,int]],
+    status: str
+) -> Tuple[Path, Path]:
+    base = vis_path.stem + "_fused"
+    out_txt = out_dir / f"{base}_attributed_transcript.txt"
+    out_json = out_dir / f"{base}_diagnostics.json"
+    out_txt.write_text("\n".join(lines), encoding="utf-8")
+
+    diag = {
+        "status": status,  # "success" or "stt_only"
+        "visual_video": str(vis_path),
+        "audio_source": str(aud_src),
+        "ics": str(ics_path) if ics_path else "",
+        "events_samples": None if grid_info is None else "see grid",
+        "attendees": [a.__dict__ for a in attendees],
+        "identities": {k: identities[k].__dict__ for k in identities} if identities else {},
+        "offset_seconds": float(best_offset),
+        "stt_segments": int(stt_segments_count),
+        "grid": ({"rows": int(grid_info[0]), "cols": int(grid_info[1])} if grid_info else {}),
+        "work_dirs": {"out": str(out_dir), "temp": str(temp_dir)},
+    }
+    out_json.write_text(json.dumps(diag, indent=2), encoding="utf-8")
+    log(f"[OUT] Transcript:  {out_txt}")
+    log(f"[OUT] Diagnostics: {out_json}")
+    return out_txt, out_json
+
 def main(argv=None):
     # Optional flag: --nogui to skip GUI even if USE_GUI_DEFAULT is True
     parser = argparse.ArgumentParser(add_help=False)
