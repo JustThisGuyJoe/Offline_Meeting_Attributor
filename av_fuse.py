@@ -501,6 +501,31 @@ def write_outputs(
     log(f"[OUT] Diagnostics: {out_json}")
     return out_txt, out_json
 
+def ensure_audio_ready(aud_src: Path, temp_dir: Path) -> Path:
+    """Return a mono/16k WAV path for STT, skipping re-FFmpeg if already suitable."""
+    if is_mono_16k_wav(aud_src):
+        # Copy into temp to keep everything in the work folder
+        target = temp_dir / aud_src.name
+        if str(target).lower() != str(aud_src).lower():
+            try:
+                target.write_bytes(aud_src.read_bytes())
+                log(f"[Audio] Using existing mono/16k WAV (copied to temp): {target}")
+            except Exception:
+                # If copy fails, just point to original
+                target = aud_src
+                log(f"[Audio] Using existing mono/16k WAV (original): {target}")
+        else:
+            log(f"[Audio] Using existing mono/16k WAV: {target}")
+        return target
+
+    # Otherwise convert/normalize
+    out_wav = temp_dir / (aud_src.stem + "_audio16k.wav")
+    log(f"[Audio] Extracting/normalizing to WAV: {out_wav}")
+    t0 = time.time()
+    out = extract_audio_to_wav(aud_src, out_wav, sr=16000)
+    log(f"[Audio] WAV ready in {time.time()-t0:.1f}s")
+    return out
+
 def main(argv=None):
     # Optional flag: --nogui to skip GUI even if USE_GUI_DEFAULT is True
     parser = argparse.ArgumentParser(add_help=False)
