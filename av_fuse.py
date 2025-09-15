@@ -121,6 +121,26 @@ def is_audio_file(path: Path) -> bool:
 def is_video_file(path: Path) -> bool:
     return path.suffix.lower() in {".mp4", ".mov", ".mkv", ".avi", ".webm"}
 
+def is_mono_16k_wav(path: Path) -> bool:
+    if path.suffix.lower() != ".wav":
+        return False
+    # Heuristic shortcut: if name already includes 'audio16k', assume it's good
+    if "audio16k" in path.stem.lower():
+        return True
+    # Quick probe via ffprobe (best effort; if it fails, fallback to False)
+    try:
+        cmd = ["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries",
+               "stream=sample_rate,channels", "-of", "default=nw=1:nk=1", str(path)]
+        proc = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        vals = [v.strip() for v in proc.stdout.splitlines() if v.strip()]
+        # Expect two lines: sample_rate then channels
+        if len(vals) >= 2:
+            sr = int(vals[0]); ch = int(vals[1])
+            return (sr == 16000 and ch == 1)
+    except Exception:
+        pass
+    return False
+
 @dataclass
 class Attendee:
     name: str
