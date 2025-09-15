@@ -484,7 +484,7 @@ def write_outputs(
     out_txt.write_text("\n".join(lines), encoding="utf-8")
 
     diag = {
-        "status": status,  # "success" or "stt_only"
+        "status": status,  # "stt_only_provisional" | "stt_only" | "success"
         "visual_video": str(vis_path),
         "audio_source": str(aud_src),
         "ics": str(ics_path) if ics_path else "",
