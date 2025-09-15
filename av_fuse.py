@@ -185,7 +185,7 @@ def hsv_blue_mask(bgr: np.ndarray) -> np.ndarray:
     m2 = cv2.inRange(hsv, lower2, upper2)
     return cv2.bitwise_or(m1, m2)
 
-def choose_grid(frame_shape: Tuple[int,int,int]) -> List[Tuple[int,int]]:
+def choose_grids() -> List[Tuple[int,int]]:
     return [(3,3), (4,4)]
 
 def tile_border_ring_mask(h: int, w: int, rows: int, cols: int, border_px: int = 10) -> List[np.ndarray]:
@@ -215,29 +215,35 @@ def tile_bottom_label_roi(h: int, w: int, rows: int, cols: int, band_fraction: f
             rois.append((x0,y0,x1,y1))
     return rois
 
-def detect_highlight_series(video_path: Path, fps_sample: float = 2.0, grids=((3,3),(4,4)), ocr: bool=True) -> Tuple[List[TileEvent], Dict[int, TileIdentity]]:
+def detect_highlight_series(video_path: Path, fps_sample: float, do_ocr: bool) -> Tuple[List[TileEvent], Dict[int, TileIdentity], Tuple[int,int]]:
+    log(f"[Visual] Opening: {video_path}")
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise RuntimeError(f"Could not open video: {video_path}")
     v_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     v_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     v_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    step = max(1, int(round(v_fps / fps_sample)))
-    ok, frame0 = cap.read()
-    if not ok:
-        raise RuntimeError("Empty video.")
-    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    log(f"[Visual] Resolution: {v_w}x{v_h}, FPS: {v_fps:.2f}, Frames: {total_frames}")
+
+    step = max(1, int(round(v_fps / max(0.1, fps_sample))))
+    grids = choose_grids()
     best_grid = None
     best_score = -1.0
-    blue_events_by_grid = {}
-    label_texts_by_grid = {}
+    best_events = None
+    best_labels = None
+
     for (R,C) in grids:
+        log(f"[Visual] Trying grid {R}x{C}")
         masks = tile_border_ring_mask(v_h, v_w, R, C, border_px=8)
         rois = tile_bottom_label_roi(v_h, v_w, R, C, band_fraction=0.20)
-        events = []
+        events: List[TileEvent] = []
         label_samples = {i: [] for i in range(R*C)}
-        f_idx = 0
+
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        processed = 0
+        t0 = time.time()
+        f_idx = 0
         while True:
             ok, frame = cap.read()
             if not ok:
@@ -263,55 +269,51 @@ def detect_highlight_series(video_path: Path, fps_sample: float = 2.0, grids=((3
                 txt = re.sub(r"\s+", " ", txt)
                 if txt:
                     label_samples[tile_idx].append(txt)
+
             f_idx += 1
-        same_runs = 0
-        for i in range(1, len(events)):
-            if events[i].tile_idx == events[i-1].tile_idx:
-                same_runs += 1
+            processed += 1
+            if processed % 50 == 0:
+                log(f"[Visual] Grid {R}x{C}: sampled {processed} frames...")
+
+        same_runs = sum(1 for i in range(1, len(events)) if events[i].tile_idx == events[i-1].tile_idx)
         stability = same_runs / max(1, len(events))
+        log(f"[Visual] Grid {R}x{C} stability={stability:.3f} (samples={len(events)}) in {time.time()-t0:.1f}s")
         if stability > best_score:
             best_score = stability
             best_grid = (R, C)
-            blue_events_by_grid[(R,C)] = events
-            label_texts_by_grid[(R,C)] = label_samples
-    events = blue_events_by_grid[best_grid]
-    label_samples = label_texts_by_grid[best_grid]
-    R, C = best_grid
-    eprint(f"[Visual] Selected grid: {R}x{C} (stability={best_score:.3f})")
+            best_events = events
+            best_labels = label_samples
+
     identities: Dict[int, TileIdentity] = {}
+    R, C = best_grid
     for idx in range(R*C):
-        samples = label_samples.get(idx, [])
+        samples = best_labels.get(idx, [])
         if not samples:
             raw = ""
         else:
             values, counts = np.unique(np.array(samples), return_counts=True)
             raw = str(values[np.argmax(counts)])
         identities[idx] = TileIdentity(idx=idx, label_raw=raw, name_mapped="")
+
     cap.release()
-    return events, identities
+    log(f"[Visual] Selected grid: {R}x{C} (stability={best_score:.3f})")
+    return best_events, identities, best_grid
 
 def first_stable_highlight_time(events: List[TileEvent], stable_len: int = 3) -> Optional[float]:
     if not events:
         return None
     for i in range(len(events) - stable_len + 1):
         tid = events[i].tile_idx
-        ok = True
-        for j in range(1, stable_len):
-            if events[i+j].tile_idx != tid:
-                ok = False
-                break
-        if ok:
+        if all(events[i+j].tile_idx == tid for j in range(1, stable_len)):
             return events[i].t
     return events[0].t
 
 def refine_offset_grid(events: List[TileEvent], stt: List[STTSegment], initial_offset: float, search_window: float = 10.0, step: float = 0.1) -> float:
-    change_times = []
-    for i in range(1, len(events)):
-        if events[i].tile_idx != events[i-1].tile_idx:
-            change_times.append(events[i].t)
+    change_times = [events[i].t for i in range(1, len(events)) if events[i].tile_idx != events[i-1].tile_idx]
     seg_starts = [s.start for s in stt]
     if not change_times or not seg_starts:
         return initial_offset
+
     def bin_times(times: List[float]) -> np.ndarray:
         if not times:
             return np.zeros(1, dtype=int)
