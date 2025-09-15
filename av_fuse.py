@@ -491,7 +491,6 @@ def main(argv=None):
 
     cfg = dict(CONFIG)
     use_gui = USE_GUI_DEFAULT and not args.nogui
-
     if use_gui:
         cfg = pick_inputs_with_gui(cfg)
 
@@ -499,6 +498,10 @@ def main(argv=None):
     aud_src  = Path(cfg["AUDIO_SOURCE"]) if cfg["AUDIO_SOURCE"] else None
     ics_path = Path(cfg["ICS_FILE"]) if cfg["ICS_FILE"] else None
     work_dir = Path(cfg["WORK_DIR"]) if cfg["WORK_DIR"] else None
+
+    log("[FILES] Visual: " + (str(vis_path) if vis_path else "<none>"))
+    log("[FILES] Audio:  " + (str(aud_src) if aud_src else "<none>"))
+    log("[FILES] ICS:    " + (str(ics_path) if ics_path else "<none>"))
 
     if not vis_path or not vis_path.exists():
         raise FileNotFoundError("Missing VISUAL_VIDEO. Set CONFIG['VISUAL_VIDEO'] or use GUI.")
@@ -508,6 +511,10 @@ def main(argv=None):
         raise FileNotFoundError("Missing WORK_DIR. Set CONFIG['WORK_DIR'] or use GUI.")
 
     out_dir, temp_dir = ensure_work_dirs(work_dir)
+    # open a run log inside out\
+    run_log_path = out_dir / (vis_path.stem + "_run.log")
+    _open_log_file(run_log_path)
+
     log(f"[Paths] Work: {work_dir}")
     log(f"[Paths] Out:  {out_dir}")
     log(f"[Paths] Temp: {temp_dir}")
@@ -617,27 +624,14 @@ def main(argv=None):
     attributed = merge_consecutive_segments(attributed)
     lines = format_transcript_lines(attributed)
 
-    # Write outputs
-    base = vis_path.stem + "_fused"
-    out_txt = out_dir / f"{base}_attributed_transcript.txt"
-    out_json = out_dir / f"{base}_diagnostics.json"
-    out_txt.write_text("\n".join(lines), encoding="utf-8")
-    diag = {
-        "visual_video": str(vis_path),
-        "audio_source": str(aud_src),
-        "ics": str(ics_path) if ics_path else "",
-        "events_samples": len(events),
-        "attendees": [a.__dict__ for a in attendees],
-        "identities": {k: identities[k].__dict__ for k in identities},
-        "offset_seconds": float(best_offset),
-        "stt_segments": len(stt_segments),
-        "grid": {"rows": int(R), "cols": int(C)},
-        "work_dirs": {"out": str(out_txt.parent), "temp": str((out_txt.parent.parent / "temp"))},
-    }
-    out_json.write_text(json.dumps(diag, indent=2), encoding="utf-8")
-    log(f"[OUT] Transcript:  {out_txt}")
-    log(f"[OUT] Diagnostics: {out_json}")
+    # Success write
+    write_outputs(
+        vis_path, aud_src, ics_path, out_dir, temp_dir,
+        lines, attendees, identities, best_offset,
+        len(stt_segments), grid_info, status="success"
+    )
     log(f"[DONE] Attributed lines: {len(lines)}")
+    close_log()
     return 0
 
 if __name__ == "__main__":
@@ -646,4 +640,5 @@ if __name__ == "__main__":
     except Exception as ex:
         elog("[FATAL] Unhandled exception: " + str(ex))
         traceback.print_exc()
+        close_log()
         sys.exit(1)
