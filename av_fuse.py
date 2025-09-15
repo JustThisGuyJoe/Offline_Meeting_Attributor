@@ -251,16 +251,28 @@ def tile_bottom_label_roi(h: int, w: int, rows: int, cols: int, band_fraction: f
             rois.append((x0,y0,x1,y1))
     return rois
 
-def detect_highlight_series(video_path: Path, fps_sample: float, do_ocr: bool) -> Tuple[List[TileEvent], Dict[int, TileIdentity], Tuple[int,int]]:
-    log(f"[Visual] Opening: {video_path}")
+def detect_highlight_series(
+    video_path: Path,
+    fps_sample: float,
+    do_ocr: bool,
+    debug_snapshots: bool,
+    snapshot_every: int,
+    temp_dir: Path
+) -> Tuple[List[TileEvent], Dict[int, TileIdentity], Tuple[int,int]]:
+    log(f"[Visual] Starting analysis for: {video_path}")
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise RuntimeError(f"Could not open video: {video_path}")
+    ok, probe = cap.read()
+    if not ok or probe is None:
+        cap.release()
+        raise RuntimeError(f"Video opened but first frame read failed: {video_path}")
     v_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     v_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     v_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     log(f"[Visual] Resolution: {v_w}x{v_h}, FPS: {v_fps:.2f}, Frames: {total_frames}")
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
     step = max(1, int(round(v_fps / max(0.1, fps_sample))))
     grids = choose_grids()
@@ -280,6 +292,7 @@ def detect_highlight_series(video_path: Path, fps_sample: float, do_ocr: bool) -
         processed = 0
         t0 = time.time()
         f_idx = 0
+        snap_count = 0
         while True:
             ok, frame = cap.read()
             if not ok:
@@ -303,6 +316,14 @@ def detect_highlight_series(video_path: Path, fps_sample: float, do_ocr: bool) -
                 txt = re.sub(r"\s+", " ", txt)
                 if txt:
                     label_samples[tile_idx].append(txt)
+
+            if debug_snapshots and (processed % max(1, snapshot_every) == 0):
+                snap_path = temp_dir / f"debug_frame_{R}x{C}_{snap_count:04d}.jpg"
+                try:
+                    cv2.imwrite(str(snap_path), frame)
+                    snap_count += 1
+                except Exception as _:
+                    pass
 
             f_idx += 1
             processed += 1
@@ -476,30 +497,73 @@ def main(argv=None):
         compute_type=cfg["WHISPER_COMPUTE"]
     )
     if not stt_segments:
-        log("[STT] No segments produced—exiting.")
+        log("[STT] No segments produced—writing empty transcript and exiting.")
+        write_outputs(vis_path, aud_src, ics_path, out_dir, temp_dir, [], attendees, {}, 0.0, 0, None, status="stt_only")
+        close_log()
         return 2
 
-    # Visual
-    do_ocr = bool(cfg["OCR_ENABLED"] and (pytesseract is not None))
-    if cfg["OCR_ENABLED"] and pytesseract is None:
-        log("[OCR] pytesseract not found; proceeding without OCR of bottom labels.")
-    events, identities, grid = detect_highlight_series(vis_path, fps_sample=float(cfg["FPS_SAMPLE"]), do_ocr=do_ocr)
+    # VISUAL Preflight
+    log("[Visual] Preflight: opening video...")
+    test_cap = cv2.VideoCapture(str(vis_path))
+    if not test_cap.isOpened():
+        log(f"[Visual][ERROR] Cannot open video: {vis_path}")
+        lines = [f"Unknown: {s.text}" for s in stt_segments]
+        write_outputs(vis_path, aud_src, ics_path, out_dir, temp_dir, lines, attendees, {}, 0.0, len(stt_segments), None, status="stt_only")
+        close_log()
+        return 4
+    ok, frm0 = test_cap.read()
+    test_cap.release()
+    if not ok or frm0 is None:
+        log(f"[Visual][ERROR] Opened but first frame read failed: {vis_path}")
+        lines = [f"Unknown: {s.text}" for s in stt_segments]
+        write_outputs(vis_path, aud_src, ics_path, out_dir, temp_dir, lines, attendees, {}, 0.0, len(stt_segments), None, status="stt_only")
+        close_log()
+        return 5
+    log("[Visual] Preflight OK; starting detection...")
+
+    # VISUAL Detection
+    identities: Dict[int, TileIdentity] = {}
+    events: List[TileEvent] = []
+    grid_info: Optional[Tuple[int,int]] = None
+    try:
+        events, identities, grid_info = detect_highlight_series(
+            vis_path,
+            fps_sample=float(cfg["FPS_SAMPLE"]),
+            do_ocr=bool(cfg["OCR_ENABLED"] and pytesseract is not None),
+            debug_snapshots=bool(cfg["DEBUG_SNAPSHOTS"]),
+            snapshot_every=int(cfg["SNAPSHOT_EVERY"]),
+            temp_dir=temp_dir
+        )
+    except Exception as ex:
+        elog("[Visual][FATAL] Exception in detection: " + str(ex))
+        traceback.print_exc()
+        # Fallback to STT-only output
+        lines = [f"Unknown: {s.text}" for s in stt_segments]
+        write_outputs(vis_path, aud_src, ics_path, out_dir, temp_dir, lines, attendees, {}, 0.0, len(stt_segments), None, status="stt_only")
+        close_log()
+        return 6
+
     if not events:
-        log("[Visual] No highlight events detected—cannot attribute. Exiting.")
+        log("[Visual] No highlight events detected—writing STT-only transcript.")
+        lines = [f"Unknown: {s.text}" for s in stt_segments]
+        write_outputs(vis_path, aud_src, ics_path, out_dir, temp_dir, lines, attendees, {}, 0.0, len(stt_segments), grid_info, status="stt_only")
+        close_log()
         return 3
-    R, C = grid
+
+    R, C = grid_info
     log(f"[Visual] Events: {len(events)}, Grid: {R}x{C}")
 
+    # Map OCR -> ICS
     identities = map_identities_to_ics(identities, attendees)
 
-    # Offset
+    # Offset estimate + refine
     t_vis0 = first_stable_highlight_time(events) or 0.0
     t_aud0 = stt_segments[0].start if stt_segments else 0.0
     initial = t_vis0 - t_aud0
     log(f"[Align] Initial guess offset = visual({t_vis0:.2f}) - audio({t_aud0:.2f}) = {initial:.2f}s")
     best_offset = refine_offset_grid(events, stt_segments, initial_offset=initial, search_window=10.0, step=0.1)
 
-    # Attribute
+    # Attribute by nearest visual sample at seg.start + offset
     times_arr = np.array([ev.t for ev in events], dtype=np.float32)
     tiles_arr = np.array([ev.tile_idx for ev in events], dtype=np.int16)
 
