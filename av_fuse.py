@@ -1,61 +1,24 @@
 #!/usr/bin/env python3
-"""
-av_fuse_attributor.py
-
-Purpose
--------
-Fuse *visual attribution* from a clean Zoom screen-recording of a Teams meeting
-(with visible active-speaker blue outline) with *audio* from a separate device
-(e.g., phone video or standalone audio file), then generate a single attributed
-transcript (Speaker: text).
-
-This tool is designed to live alongside Offline_Meeting_Attributor/attributor.py
-and reuses the same ideas (HSV-based blue-border detection, grid heuristics,
-.ics attendee parsing + fuzzy-name match, STT via faster-whisper). It does NOT
-modify any of your existing files.
-
-Inputs
-------
-- Visual video (no audio needed): Zoom screen recording of the Teams call.
-- Audio source: either (a) a different video that *has* audio, or (b) an audio file.
-- .ICS invite: to normalize names/emails/companies.
-
-If CLI flags are omitted, a small GUI file picker will prompt for files.
-
-Outputs
--------
-- <basename>_attributed_transcript.txt  (lines like "Name: ...")
-- <basename>_diagnostics.json            (alignment + metadata, optional)
-- Optional intermediate WAV extracted from the audio source (temp folder).
-
-Dependencies
-------------
-pip install faster-whisper opencv-python numpy pytesseract rapidfuzz
-Also requires:
-- FFmpeg available on PATH
-- Tesseract-OCR installed and on PATH (for pytesseract), or set TESSDATA_PREFIX.
-
-Notes
------
-- We detect the active speaker by scanning for Teams' blue/cyan outline within a
-  per-tile "border ring". We auto-try 3x3 and 4x4 grids and pick the layout with
-  the best border-signal stability.
-- We OCR tile bottom labels to map tiles → names; then fuzzy-map to .ics names.
-- AV sync: we estimate an initial offset using the first stable highlight and the
-  first STT segment, then refine by grid-search over ±10s to align highlight-change
-  times with segment starts.
-- Final text merges consecutive segments from the same attributed speaker.
-"""
-
+# av_fuse.py  — V1.0.1
+#
+# V1.0.1:
+# - GUI pickers for inputs + Working Folder (creates WORK\out and WORK\temp)
+# - Minimal CLI needs (edit CONFIG below if you prefer hardcoded paths)
+# - Verbose progress prints (STT, visual scan progress, grid choice, offset, outputs)
+# - Optional OCR of bottom labels; proceeds without Tesseract if not installed
+# - Safer error reporting (prints tracebacks)
+#
 from __future__ import annotations
 
 import argparse
 import json
 import math
+import os
 import re
 import subprocess
 import sys
-import tempfile
+import time
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -142,7 +105,7 @@ def parse_ics_attendees(ics_path: Path) -> List[Attendee]:
             mail_match = re.search(r":mailto:([^ \r\n]+)", l, flags=re.I)
             name = name_match.group(1).strip() if name_match else ""
             email = mail_match.group(1).strip() if mail_match else ""
-            name = name.replace(r"\\,", ",").strip('"')
+            name = name.replace(r"\,", ",").strip('"')
             attendees.append(Attendee(name=name, email=email, company=""))
         elif l.upper().startswith("ORGANIZATION:") or l.upper().startswith("ORG:"):
             event_org = l.split(":",1)[-1].strip()
@@ -410,131 +373,152 @@ def merge_consecutive_segments(attributed: List[Tuple[str, float, float, str]]) 
     return merged
 
 def format_transcript_lines(attributed: List[Tuple[str, float, float, str]]) -> List[str]:
-    lines = []
-    for name, s, e, text in attributed:
-        nm = name if name else "Unknown"
-        lines.append(f"{nm}: {text}")
-    return lines
+    return [f"{(name or 'Unknown')}: {text}" for name, s, e, text in attributed]
+
+def ensure_work_dirs(base: Path) -> Tuple[Path, Path]:
+    out_dir = base / "out"
+    temp_dir = base / "temp"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    return out_dir, temp_dir
+
+def pick_inputs_with_gui(cfg: dict) -> dict:
+    import tkinter as tk
+    from tkinter import filedialog
+    root = tk.Tk()
+    root.withdraw()
+    if cfg["VISUAL_VIDEO"] is None:
+        cfg["VISUAL_VIDEO"] = Path(filedialog.askopenfilename(title="Select Zoom screen recording (visual only)",
+                                                              filetypes=[("Video", "*.mp4 *.mov *.mkv *.avi *.webm")]))
+    if cfg["AUDIO_SOURCE"] is None:
+        cfg["AUDIO_SOURCE"] = Path(filedialog.askopenfilename(title="Select audio source (video w/ audio OR audio)",
+                                                              filetypes=[("Media", "*.mp4 *.mov *.mkv *.avi *.webm *.wav *.m4a *.mp3 *.aac *.flac *.ogg *.opus")]))
+    if cfg["ICS_FILE"] is None:
+        cfg["ICS_FILE"] = Path(filedialog.askopenfilename(title="Select .ics invite",
+                                                          filetypes=[("iCalendar", "*.ics")]))
+    if cfg["WORK_DIR"] is None:
+        cfg["WORK_DIR"] = Path(filedialog.askdirectory(title="Select Working Folder (will create out/ and temp/)"))
+    root.destroy()
+    return cfg
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Fuse visual attribution with separate audio to produce an attributed transcript.")
-    parser.add_argument("--visual-video", type=Path, help="Path to the clean Zoom screen recording (Teams view).")
-    parser.add_argument("--audio-source", type=Path, help="Path to audio source (video with audio OR audio file).")
-    parser.add_argument("--ics", type=Path, help="Path to .ics invite (attendees).")
-    parser.add_argument("--outdir", type=Path, default=Path("."), help="Directory for outputs.")
-    parser.add_argument("--model", default="medium", help="faster-whisper model size (e.g., small, medium, large-v3).")
-    parser.add_argument("--device", default="cuda", help="faster-whisper device (cuda/cpu).")
-    parser.add_argument("--compute-type", default="float16", help="faster-whisper compute type (float16/int8).")
-    parser.add_argument("--fps-sample", type=float, default=2.0, help="FPS to sample visual frames for border detection.")
-    parser.add_argument("--no-ocr", action="store_true", help="Disable OCR of name labels.")
-    parser.add_argument("--offset", type=float, default=None, help="Override AV offset in seconds (visual_t - audio_t).")
-    parser.add_argument("--dry-run", action="store_true", help="Run detection/alignment but do not write transcript.")
-    parser.add_argument("--diagnostics", action="store_true", help="Write diagnostics JSON.")
-    parser.add_argument("--gui", action="store_true", help="Force file-pickers even if flags provided.")
-    args = parser.parse_args(argv)
+    # Optional flag: --nogui to skip GUI even if USE_GUI_DEFAULT is True
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--nogui", action="store_true")
+    args, _ = parser.parse_known_args(argv)
 
-    vis_path = args.visual_video
-    aud_src = args.audio_source
-    ics_path = args.ics
+    cfg = dict(CONFIG)
+    use_gui = USE_GUI_DEFAULT and not args.nogui
 
-    if args.gui or vis_path is None or aud_src is None or ics_path is None:
-        try:
-            import tkinter as tk
-            from tkinter import filedialog
-            tk.Tk().withdraw()
-            if vis_path is None:
-                vis_path = Path(filedialog.askopenfilename(title="Select Zoom screen recording (visual only)", filetypes=[("Video", "*.mp4 *.mov *.mkv *.avi *.webm")]))
-            if aud_src is None:
-                aud_src = Path(filedialog.askopenfilename(title="Select audio source (video w/ audio OR audio)", filetypes=[("Media", "*.mp4 *.mov *.mkv *.avi *.webm *.wav *.m4a *.mp3 *.aac *.flac *.ogg *.opus")]))
-            if ics_path is None:
-                ics_path = Path(filedialog.askopenfilename(title="Select .ics invite", filetypes=[("iCalendar", "*.ics")]))
-        except Exception as ex:
-            eprint("[GUI] File dialog failed; ensure --visual-video, --audio-source, --ics are provided.")
-            raise
+    if use_gui:
+        cfg = pick_inputs_with_gui(cfg)
+
+    vis_path = Path(cfg["VISUAL_VIDEO"]) if cfg["VISUAL_VIDEO"] else None
+    aud_src  = Path(cfg["AUDIO_SOURCE"]) if cfg["AUDIO_SOURCE"] else None
+    ics_path = Path(cfg["ICS_FILE"]) if cfg["ICS_FILE"] else None
+    work_dir = Path(cfg["WORK_DIR"]) if cfg["WORK_DIR"] else None
 
     if not vis_path or not vis_path.exists():
-        raise FileNotFoundError("--visual-video not provided or missing.")
+        raise FileNotFoundError("Missing VISUAL_VIDEO. Set CONFIG['VISUAL_VIDEO'] or use GUI.")
     if not aud_src or not aud_src.exists():
-        raise FileNotFoundError("--audio-source not provided or missing.")
-    if not ics_path or not ics_path.exists():
-        eprint("[WARN] --ics missing or not found; proceeding without attendee normalization.")
-        attendees = []
-    else:
+        raise FileNotFoundError("Missing AUDIO_SOURCE. Set CONFIG['AUDIO_SOURCE'] or use GUI.")
+    if not work_dir:
+        raise FileNotFoundError("Missing WORK_DIR. Set CONFIG['WORK_DIR'] or use GUI.")
+
+    out_dir, temp_dir = ensure_work_dirs(work_dir)
+    log(f"[Paths] Work: {work_dir}")
+    log(f"[Paths] Out:  {out_dir}")
+    log(f"[Paths] Temp: {temp_dir}")
+
+    attendees = []
+    if ics_path and ics_path.exists():
         attendees = parse_ics_attendees(ics_path)
-        eprint(f"[ICS] Loaded attendees: {len(attendees)}")
-
-    outdir = args.outdir
-    outdir.mkdir(parents=True, exist_ok=True)
-
-    with tempfile.TemporaryDirectory() as td:
-        td = Path(td)
-        if is_audio_file(aud_src):
-            wav_path = extract_audio_to_wav(aud_src, td)
-        elif is_video_file(aud_src):
-            wav_path = extract_audio_to_wav(aud_src, td)
-        else:
-            raise ValueError("audio-source must be a video with audio or an audio file.")
-        stt_segments = transcribe_wav_fwhisper(wav_path, model_size=args.model, device=args.device, compute_type=args.compute_type)
-
-    grids = choose_grid((0,0,0))
-    events, identities = detect_highlight_series(vis_path, fps_sample=args.fps_sample, grids=grids, ocr=(not args.no_ocr))
-    identities = map_identities_to_ics(identities, attendees)
-    times_arr, tiles_arr = build_tile_lookup(events)
-
-    if args.offset is not None:
-        best_offset = args.offset
-        eprint(f"[Align] Using user-provided offset: {best_offset:.2f}s")
+        log(f"[ICS] Loaded attendees: {len(attendees)}")
     else:
-        t_vis0 = first_stable_highlight_time(events) or 0.0
-        t_aud0 = stt_segments[0].start if stt_segments else 0.0
-        initial = t_vis0 - t_aud0
-        best_offset = refine_offset_grid(events, stt_segments, initial_offset=initial, search_window=10.0, step=0.1)
+        log("[ICS] No .ics provided; will use OCR labels directly.")
+
+    # Audio → WAV
+    wav_path = temp_dir / (aud_src.stem + "_audio16k.wav")
+    log(f"[Audio] Extracting/normalizing to WAV: {wav_path}")
+    t0 = time.time()
+    wav_path = extract_audio_to_wav(aud_src, wav_path, sr=16000)
+    log(f"[Audio] WAV ready in {time.time()-t0:.1f}s")
+
+    # STT
+    stt_segments = transcribe_wav_fwhisper(
+        wav_path,
+        model_size=cfg["WHISPER_MODEL"],
+        device=cfg["WHISPER_DEVICE"],
+        compute_type=cfg["WHISPER_COMPUTE"]
+    )
+    if not stt_segments:
+        log("[STT] No segments produced—exiting.")
+        return 2
+
+    # Visual
+    do_ocr = bool(cfg["OCR_ENABLED"] and (pytesseract is not None))
+    if cfg["OCR_ENABLED"] and pytesseract is None:
+        log("[OCR] pytesseract not found; proceeding without OCR of bottom labels.")
+    events, identities, grid = detect_highlight_series(vis_path, fps_sample=float(cfg["FPS_SAMPLE"]), do_ocr=do_ocr)
+    if not events:
+        log("[Visual] No highlight events detected—cannot attribute. Exiting.")
+        return 3
+    R, C = grid
+    log(f"[Visual] Events: {len(events)}, Grid: {R}x{C}")
+
+    identities = map_identities_to_ics(identities, attendees)
+
+    # Offset
+    t_vis0 = first_stable_highlight_time(events) or 0.0
+    t_aud0 = stt_segments[0].start if stt_segments else 0.0
+    initial = t_vis0 - t_aud0
+    log(f"[Align] Initial guess offset = visual({t_vis0:.2f}) - audio({t_aud0:.2f}) = {initial:.2f}s")
+    best_offset = refine_offset_grid(events, stt_segments, initial_offset=initial, search_window=10.0, step=0.1)
+
+    # Attribute
+    times_arr = np.array([ev.t for ev in events], dtype=np.float32)
+    tiles_arr = np.array([ev.tile_idx for ev in events], dtype=np.int16)
 
     attributed: List[Tuple[str, float, float, str]] = []
     for seg in stt_segments:
         t_vis = seg.start + best_offset
-        tidx = tile_at_time(times_arr, tiles_arr, t_vis)
-        if tidx is None:
-            name = "Unknown"
-        else:
-            ident = identities.get(tidx)
-            name = (ident.name_mapped or ident.label_raw or f"Tile{tidx+1}") if ident else f"Tile{tidx+1}"
+        idx = np.searchsorted(times_arr, t_vis, side="right") - 1
+        idx = int(np.clip(idx, 0, len(times_arr)-1))
+        tidx = int(tiles_arr[idx])
+        ident = identities.get(tidx)
+        name = (ident.name_mapped or ident.label_raw or f"Tile{tidx+1}") if ident else f"Tile{tidx+1}"
         attributed.append((name, seg.start, seg.end, seg.text))
 
     attributed = merge_consecutive_segments(attributed)
     lines = format_transcript_lines(attributed)
 
-    base = (vis_path.stem + "_fused")
-    out_txt = outdir / f"{base}_attributed_transcript.txt"
-    if not args.dry_run:
-        out_txt.write_text("\n".join(lines), encoding="utf-8")
-        eprint(f"[OUT] Wrote transcript: {out_txt} ({len(lines)} lines)")
-
-    if args.diagnostics:
-        diag = {
-            "visual_video": str(vis_path),
-            "audio_source": str(aud_src),
-            "ics": str(ics_path) if ics_path else "",
-            "events_samples": len(events),
-            "attendees": [a.__dict__ for a in attendees],
-            "identities": {k: identities[k].__dict__ for k in identities},
-            "offset_seconds": best_offset,
-            "stt_segments": len(stt_segments),
-            "grid_options": [(3,3),(4,4)],
-        }
-        out_json = outdir / f"{base}_diagnostics.json"
-        out_json.write_text(json.dumps(diag, indent=2), encoding="utf-8")
-        eprint(f"[OUT] Wrote diagnostics: {out_json}")
-
-    if args.dry_run:
-        eprint("[DRY-RUN] Completed without writing transcript.")
+    # Write outputs
+    base = vis_path.stem + "_fused"
+    out_txt = out_dir / f"{base}_attributed_transcript.txt"
+    out_json = out_dir / f"{base}_diagnostics.json"
+    out_txt.write_text("\n".join(lines), encoding="utf-8")
+    diag = {
+        "visual_video": str(vis_path),
+        "audio_source": str(aud_src),
+        "ics": str(ics_path) if ics_path else "",
+        "events_samples": len(events),
+        "attendees": [a.__dict__ for a in attendees],
+        "identities": {k: identities[k].__dict__ for k in identities},
+        "offset_seconds": float(best_offset),
+        "stt_segments": len(stt_segments),
+        "grid": {"rows": int(R), "cols": int(C)},
+        "work_dirs": {"out": str(out_txt.parent), "temp": str((out_txt.parent.parent / "temp"))},
+    }
+    out_json.write_text(json.dumps(diag, indent=2), encoding="utf-8")
+    log(f"[OUT] Transcript:  {out_txt}")
+    log(f"[OUT] Diagnostics: {out_json}")
+    log(f"[DONE] Attributed lines: {len(lines)}")
+    return 0
 
 if __name__ == "__main__":
     try:
-        main()
-    except KeyboardInterrupt:
-        eprint("Interrupted by user.")
-        sys.exit(130)
+        sys.exit(main())
     except Exception as ex:
-        eprint(f"[ERROR] {ex}")
+        elog("[FATAL] Unhandled exception: " + str(ex))
+        traceback.print_exc()
         sys.exit(1)
