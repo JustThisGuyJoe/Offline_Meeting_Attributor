@@ -569,12 +569,8 @@ def main(argv=None):
     else:
         log("[ICS] No .ics provided; will use OCR labels directly.")
 
-    # Audio → WAV
-    wav_path = temp_dir / (aud_src.stem + "_audio16k.wav")
-    log(f"[Audio] Extracting/normalizing to WAV: {wav_path}")
-    t0 = time.time()
-    wav_path = extract_audio_to_wav(aud_src, wav_path, sr=16000)
-    log(f"[Audio] WAV ready in {time.time()-t0:.1f}s")
+    # Audio → WAV (skip if already good)
+    wav_path = ensure_audio_ready(aud_src, temp_dir)
 
     # STT
     stt_segments = transcribe_wav_fwhisper(
