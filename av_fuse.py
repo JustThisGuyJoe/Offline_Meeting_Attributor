@@ -1,13 +1,6 @@
 #!/usr/bin/env python3
-# av_fuse.py — V1.0.8
-#
-# Changes vs V1.0.7:
-# - Normalize ICS attendee names from emails (e.g., "first.last@..." → "First Last").
-# - Add CONFIG["TILE_NAME_OVERRIDES"] to force-map a tile index to a display name.
-# - Emit a grid preview image with tile indices, and a tile-activity CSV.
-# - Keep OCR name sanitation + strict ICS mapping from V1.0.7.
-# - Preserve provisional writes + atexit emergency writer safeguards.
-#
+# av_fuse.py — V1.1.0
+
 from __future__ import annotations
 
 import argparse, atexit, json, math, os, re, subprocess, sys, time, traceback, gc, csv
