@@ -47,7 +47,22 @@ CONFIG = {
 
     "DEBUG_SNAPSHOTS": False,
     "SNAPSHOT_EVERY": 150,
+
+    # NEW: manual tile -> name overrides (use tile index, zero-based)
+    "TILE_NAME_OVERRIDES": {
+        # 14: "Tyler Lastname",
+        # 7: "Justin Lastname",
+    },
+
+    # NEW: crop away UI bars (pixels). Tune if needed.
+    "CANVAS_CROP": {"top": 80, "bottom": 80, "left": 0, "right": 0},
+
+    # NEW: optionally force the grid layout. Set to (3,3) for Teams gallery.
+    # Leave as None to auto-try both.
+    "FORCE_GRID": None,  # e.g., (3,3)
 }
+# Optional: force Teams layout for this run
+CONFIG["FORCE_GRID"] = (3, 3)
 
 USE_GUI_DEFAULT = True
 
@@ -199,6 +214,9 @@ def hsv_blue_mask(bgr: np.ndarray) -> np.ndarray:
     return cv2.bitwise_or(cv2.inRange(hsv, lower1, upper1), cv2.inRange(hsv, lower2, upper2))
 
 def choose_grids() -> List[Tuple[int,int]]:
+    fg = CONFIG.get("FORCE_GRID")
+    if isinstance(fg, (tuple, list)) and len(fg) == 2:
+        return [tuple(fg)]
     return [(3,3), (4,4)]
 
 def tile_border_ring_mask(h: int, w: int, rows: int, cols: int, border_px: int = 10) -> List[np.ndarray]:
@@ -457,6 +475,51 @@ def ensure_audio_ready(aud_src: Path, temp_dir: Path) -> Path:
     log(f"[Audio] WAV ready")
     return out_wav
 
+# NEW: helper to save a grid preview image with tile indices
+def _save_grid_preview(video_path: Path, grid: Tuple[int,int], out_path: Path, sample_time_s: Optional[float] = None) -> None:
+    cap = cv2.VideoCapture(str(video_path))
+    if sample_time_s is not None:
+        cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, float(sample_time_s))*1000.0)
+    else:
+        # fallback: 20% into the video
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        if total_frames > 0:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(total_frames*0.2))
+    ok, frame = cap.read()
+    cap.release()
+    if not ok or frame is None:
+        return
+    frame_c, _off = _crop_canvas(frame, CONFIG.get("CANVAS_CROP", {}))
+    R, C = grid
+    h, w = frame_c.shape[:2]
+    th = h // R; tw = w // C
+    for r in range(R):
+        for c in range(C):
+            y0, y1 = r*th, min((r+1)*th, h)
+            x0, x1 = c*tw, min((c+1)*tw, w)
+            idx = r*C + c
+            cv2.rectangle(frame_c, (x0, y0), (x1-1, y1-1), (255, 255, 255), 2)
+            cv2.putText(frame_c, f"Tile{idx+1} ({idx})", (x0+10, y0+30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255,255,255), 2, cv2.LINE_AA)
+    cv2.imwrite(str(out_path), frame_c)
+
+# NEW: helper to write a tile-activity CSV (approx “talk time” per tile)
+def _write_tile_activity_csv(events: List["TileEvent"], grid: Tuple[int,int], out_csv: Path) -> None:
+    if not events:
+        return
+    totals: Dict[int, float] = {}
+    for i in range(len(events)-1):
+        t0, t1 = events[i].t, events[i+1].t
+        idx = events[i].tile_idx
+        totals[idx] = totals.get(idx, 0.0) + max(0.0, t1 - t0)
+    rows = sorted(((idx, totals.get(idx, 0.0)) for idx in range(grid[0]*grid[1])),
+                  key=lambda x: x[1], reverse=True)
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    with out_csv.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["tile_idx", "approx_seconds"])
+        w.writerows(rows)
+
 def main(argv=None):
     parser = argparse.ArgumentParser(add_help=False); parser.add_argument("--nogui", action="store_true")
     args,_ = parser.parse_known_args(argv)
@@ -536,8 +599,19 @@ def main(argv=None):
         log("[Visual] No highlight events — keeping STT-only.")
         close_log(); return 3
 
-    R,C = grid
+    R, C = grid
     log(f"[Visual] Events: {len(events)}, Grid: {R}x{C}")
+
+    # grid preview + tile activity aids
+    base = vis_path.stem + "_fused"
+    preview_path = out_dir / f"{base}_grid_preview.jpg"
+    mid_t = events[len(events)//2].t if events else 0.0
+    _save_grid_preview(vis_path, grid, preview_path, sample_time_s=mid_t)
+    log(f"[OUT] Grid preview: {preview_path}")
+
+    activity_csv = out_dir / f"{base}_tile_activity.csv"
+    _write_tile_activity_csv(events, grid, activity_csv)
+    log(f"[OUT] Tile activity: {activity_csv}")
 
     identities = map_identities_to_ics(identities, attendees)
 
@@ -550,12 +624,14 @@ def main(argv=None):
     times_arr = np.array([ev.t for ev in events], dtype=np.float32)
     tiles_arr = np.array([ev.tile_idx for ev in events], dtype=np.int16)
 
+    # Attribution (apply overrides first)
+    overrides = cfg.get("TILE_NAME_OVERRIDES", {}) or {}
     attributed: List[Tuple[str,float,float,str]] = []
     for seg in stt_segments:
         t_vis = seg.start + best_offset
         idx = int(np.clip(np.searchsorted(times_arr, t_vis, side="right") - 1, 0, len(times_arr)-1))
         tidx = int(tiles_arr[idx]); ident = identities.get(tidx)
-        name = (ident.name_mapped or ident.label_raw or f"Tile{tidx+1}") if ident else f"Tile{tidx+1}"
+        name = overrides.get(tidx) or ((ident.name_mapped or ident.label_raw or f"Tile{tidx+1}") if ident else f"Tile{tidx+1}")
         attributed.append((name, seg.start, seg.end, seg.text))
 
     attributed = merge_consecutive_segments(attributed)
@@ -567,7 +643,6 @@ def main(argv=None):
     _emergency["enabled"] = False
     log("[Success] Final outputs written; emergency atexit disabled.")
     # Optional: release model only after success writes
-    # (If you see crashes at program end, leave it alive.)
     # global _WHISPER_MODEL; _WHISPER_MODEL = None; gc.collect()
 
     close_log()
