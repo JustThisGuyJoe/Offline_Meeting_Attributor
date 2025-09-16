@@ -434,12 +434,17 @@ def detect_highlight_series(video_path: Path, fps_sample: float, do_ocr: bool,
 
     for (R,C) in grids:
         log(f"[Visual] Trying grid {R}x{C}")
-        # read one fresh frame to size the cropped canvas
+        # size the cropped canvas and inner ROI from a probe frame
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
         ok_probe, probe = cap.read()
         if not ok_probe or probe is None:
             cap.release(); raise RuntimeError("Opened video, but probe read failed")
-        probe_cropped, _off = _crop_canvas(probe, CONFIG.get("CANVAS_CROP", {}))
+        frame_c0, _ = _crop_canvas(probe, CONFIG.get("CANVAS_CROP", {}))
+        inner_rect = (0,0,frame_c0.shape[1], frame_c0.shape[0])
+        if CONFIG.get("AUTO_INNER_DETECT", True):
+            inner_rect = _auto_inner_rect(frame_c0, CONFIG.get("AUTO_INNER_MAX_SHRINK", 0.20))
+        x0i,y0i,x1i,y1i = inner_rect
+        probe_cropped = frame_c0[y0i:y1i, x0i:x1i]
         v_h, v_w = probe_cropped.shape[:2]
 
         masks = tile_border_ring_mask(v_h, v_w, R, C, border_px=8)
@@ -455,18 +460,18 @@ def detect_highlight_series(video_path: Path, fps_sample: float, do_ocr: bool,
             if f_idx % step != 0:
                 f_idx += 1; continue
 
-            # NEW: crop UI bars before analysis
-            frame_c, _off = _crop_canvas(frame, CONFIG.get("CANVAS_CROP", {}))
-            mask_bord = highlight_mask(frame_c)
+            # crop UI bars then inner ROI
+            frame_c, _ = _crop_canvas(frame, CONFIG.get("CANVAS_CROP", {}))
+            frame_in = frame_c[y0i:y1i, x0i:x1i]
 
-            # score per tile ring
+            mask_bord = highlight_mask(frame_in)
             scores = [int(cv2.countNonZero(cv2.bitwise_and(mask_bord, m))) for m in masks]
             tile_idx = int(np.argmax(scores)); t = f_idx / v_fps
             events.append(TileEvent(t, tile_idx))
 
             if do_ocr and pytesseract is not None:
                 x0,y0,x1,y1 = rois[tile_idx]
-                band = frame_c[y0:y1, x0:x1]
+                band = frame_in[y0:y1, x0:x1]
                 band = cv2.resize(band, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
                 gray = cv2.cvtColor(band, cv2.COLOR_BGR2GRAY)
                 gray = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)[1]
@@ -477,13 +482,14 @@ def detect_highlight_series(video_path: Path, fps_sample: float, do_ocr: bool,
 
             if debug_snapshots and (processed % max(1, snapshot_every) == 0):
                 try:
-                    cv2.imwrite(str((temp_dir / f"debug_{R}x{C}_{snap:04d}.jpg")), frame_c); snap += 1
+                    cv2.imwrite(str((temp_dir / f"debug_{R}x{C}_{snap:04d}.jpg")), frame_in); snap += 1
                 except Exception: pass
 
             f_idx += 1; processed += 1
             if processed % 50 == 0:
                 log(f"[Visual] Grid {R}x{C}: sampled {processed} frames...")
 
+        # stability & best-grid update
         same_runs = sum(1 for i in range(1, len(events)) if events[i].tile_idx == events[i-1].tile_idx)
         stability = same_runs / max(1, len(events))
         log(f"[Visual] Grid {R}x{C} stability={stability:.3f} (samples={len(events)}) in {time.time()-t0:.1f}s")
