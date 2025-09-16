@@ -368,11 +368,18 @@ class TileIdentity:
     label_raw: str
     name_mapped: str
 
-def hsv_blue_mask(bgr: np.ndarray) -> np.ndarray:
+def highlight_mask(bgr: np.ndarray) -> np.ndarray:
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    # blue-ish ring (Zoom)
     lower1 = np.array([85, 70, 70]); upper1 = np.array([130, 255, 255])
     lower2 = np.array([100, 80, 80]); upper2 = np.array([140, 255, 255])
-    return cv2.bitwise_or(cv2.inRange(hsv, lower1, upper1), cv2.inRange(hsv, lower2, upper2))
+    blue = cv2.bitwise_or(cv2.inRange(hsv, lower1, upper1), cv2.inRange(hsv, lower2, upper2))
+    # white/bright ring (Teams)
+    v = hsv[:, :, 2]; s = hsv[:, :, 1]
+    bright = cv2.inRange(v, 220, 255)
+    low_sat = cv2.inRange(s, 0, 60)
+    white = cv2.bitwise_and(bright, low_sat)
+    return cv2.bitwise_or(blue, white)
 
 def choose_grids() -> List[Tuple[int,int]]:
     fg = CONFIG.get("FORCE_GRID")
