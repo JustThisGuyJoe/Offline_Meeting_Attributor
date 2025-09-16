@@ -34,8 +34,8 @@ CONFIG = {
 
     # STT
     "WHISPER_MODEL": "medium",
-    "WHISPER_DEVICE": "cuda",      # "cuda" or "cpu"
-    "WHISPER_COMPUTE": "float16",  # "float16" or "int8" (cpu)
+    "WHISPER_DEVICE": "cuda",       # "cuda" or "cpu"
+    "WHISPER_COMPUTE": "float16",   # "float16" or "int8" (cpu)
 
     # Visual
     "FPS_SAMPLE": 2.0,
@@ -58,17 +58,19 @@ CONFIG = {
 
     # Auto-detect inner gallery rectangle (handles maximized window vs fullscreen)
     "AUTO_INNER_DETECT": True,
-    "AUTO_INNER_MAX_SHRINK": 0.10,   # <=10% per side, conservative
+    "AUTO_INNER_MAX_SHRINK": 0.12,   # allow up to 12% per side
 
-    # OCR: read the *bottom-left* name bar only (avoid avatar initials)
-    "LABEL_LEFT_FRAC": 0.48,         # left portion width inside tile
-    "LABEL_HEIGHT_FRAC": 0.14,       # bottom band height inside tile
+    # OCR: read both TOP-LEFT and BOTTOM-LEFT name bars (avoid avatar initials)
+    "LABEL_LEFT_FRAC": 0.55,         # left portion width inside tile
+    "LABEL_BOTTOM_FRAC": 0.10,       # bottom band height inside tile
+    "LABEL_TOP_FRAC": 0.12,          # top band height inside tile
     "OCR_MIN_TOKENS": 2,
     "OCR_MAX_TOKENS": 3,
-    "TESS_CONFIG": "--psm 7 -l eng", # psm 7 = single text line (fits name bar)
+    "TESS_CONFIG": "--psm 7 -l eng", # single text line
 
-    # ICS fuzz cutoff
-    "FUZZ_CUTOFF": 78,               # slightly looser to catch Egolf/Gabriel, etc.
+    # ICS mapping
+    "FUZZ_CUTOFF": 78,               # overall match
+    "TOKEN_FUZZ": 85,                # per-token similarity requirement
 }
 
 USE_GUI_DEFAULT = True
@@ -141,8 +143,8 @@ def _crop_canvas(frame: np.ndarray, crop: Dict[str,int]) -> Tuple[np.ndarray, Tu
     x0 = min(max(0, l), w-1); x1 = max(x0+1, w - max(0, r))
     return frame[y0:y1, x0:x1].copy(), (x0, y0)
 
-# NEW: edge-based inner gallery detection (very conservative)
-def _auto_inner_rect_edges(frame_c: np.ndarray, max_shrink_pct: float = 0.10) -> Tuple[int,int,int,int]:
+# edge-based inner gallery detection (conservative)
+def _auto_inner_rect_edges(frame_c: np.ndarray, max_shrink_pct: float = 0.12) -> Tuple[int,int,int,int]:
     h, w = frame_c.shape[:2]
     if h < 200 or w < 200:
         return 0, 0, w, h
