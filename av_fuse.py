@@ -112,55 +112,43 @@ class Attendee:
     email: str = ""
     company: str = ""
 
-def parse_ics_attendees(ics_path: Path) -> List[Attendee]:
-    attendees: List[Attendee] = []
-    if not ics_path or not ics_path.exists():
-        return attendees
-    lines = ics_path.read_text(encoding="utf-8", errors="ignore").splitlines()
-    event_org = ""
+def parse_ics_attendees(p: Path) -> List[Attendee]:
+    out: List[Attendee] = []
+    if not p or not p.exists(): return out
+    lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()
+    org = ""
     for ln in lines:
-        l = ln.strip()
-        if l.upper().startswith("ATTENDEE"):
-            name_match = re.search(r";CN=([^;:]+)", l, flags=re.I)
-            mail_match = re.search(r":mailto:([^ \r\n]+)", l, flags=re.I)
-            name = name_match.group(1).strip() if name_match else ""
-            email = mail_match.group(1).strip() if mail_match else ""
-            name = name.replace(r"\,", ",").strip('"')
-            attendees.append(Attendee(name=name, email=email, company=""))
-        elif l.upper().startswith("ORGANIZATION:") or l.upper().startswith("ORG:"):
-            event_org = l.split(":",1)[-1].strip()
-    if event_org and attendees:
-        for a in attendees:
-            if not a.company:
-                a.company = event_org
-    return attendees
+        L = ln.strip()
+        if L.upper().startswith("ATTENDEE"):
+            m1 = re.search(r";CN=([^;:]+)", L, flags=re.I)
+            m2 = re.search(r":mailto:([^ \r\n]+)", L, flags=re.I)
+            name = (m1.group(1).strip() if m1 else "").replace(r"\,", ",").strip('"')
+            email = (m2.group(1).strip() if m2 else "")
+            out.append(Attendee(name=name, email=email, company=""))
+        elif L.upper().startswith("ORGANIZATION:") or L.upper().startswith("ORG:"):
+            org = L.split(":",1)[-1].strip()
+    if org:
+        for a in out:
+            if not a.company: a.company = org
+    return out
 
 def best_icsonym_match(raw: str, icsonyms: List[str]) -> Optional[str]:
-    if not raw:
-        return None
+    if not raw: return None
     s = re.sub(r"[^A-Za-z0-9@\.\-\' ]+", "", raw).strip()
-    if not s:
-        return None
-    if not icsonyms:
-        return s
+    if not s: return None
+    if not icsonyms: return s
     if process and fuzz:
         m = process.extractOne(s, icsonyms, scorer=fuzz.WRatio, score_cutoff=72)
-        if m:
-            return m[0]
-        return s
-    else:
-        for can in icsonyms:
-            if s.lower() == can.lower():
-                return can
-        return s
+        return m[0] if m else s
+    for can in icsonyms:
+        if s.lower() == can.lower(): return can
+    return s
 
 def extract_audio_to_wav(src: Path, out_wav: Path, sr: int = 16000) -> Path:
     out_wav.parent.mkdir(parents=True, exist_ok=True)
-    cmd = ["ffmpeg", "-y", "-i", str(src), "-vn", "-ac", "1", "-ar", str(sr), "-f", "wav", str(out_wav)]
-    proc = run(cmd, check=True)
+    proc = run(["ffmpeg","-y","-i",str(src),"-vn","-ac","1","-ar",str(sr),"-f","wav",str(out_wav)], check=True)
     if proc.returncode != 0:
-        elog(proc.stderr)
-        raise RuntimeError("ffmpeg failed to extract audio.")
+        elog(proc.stderr); raise RuntimeError("ffmpeg failed")
     return out_wav
 
 @dataclass
@@ -344,24 +332,22 @@ def map_identities_to_ics(identities: Dict[int, TileIdentity], attendees: List[A
     icsonyms = [a.name for a in attendees if a.name]
     for idx, ident in identities.items():
         mapped = best_icsonym_match(ident.label_raw, icsonyms) if icsonyms else ident.label_raw
-        identities[idx] = TileIdentity(idx=idx, label_raw=ident.label_raw, name_mapped=mapped or ident.label_raw)
+        identities[idx] = TileIdentity(idx, ident.label_raw, mapped or ident.label_raw)
     return identities
 
-def merge_consecutive_segments(attributed: List[Tuple[str, float, float, str]]) -> List[Tuple[str, float, float, str]]:
+def merge_consecutive_segments(attributed: List[Tuple[str,float,float,str]]) -> List[Tuple[str,float,float,str]]:
     if not attributed: return []
-    merged = [attributed[0]]
-    for name, s, e, text in attributed[1:]:
-        pn, ps, pe, pt = merged[-1]
-        if name == pn and abs(s - pe) < 0.75:
-            merged[-1] = (pn, ps, e, (pt + " " + text).strip())
-        else:
-            merged.append((name, s, e, text))
-    return merged
+    m=[attributed[0]]
+    for name,s,e,txt in attributed[1:]:
+        pn,ps,pe,pt = m[-1]
+        if name==pn and abs(s-pe)<0.75: m[-1]=(pn,ps,e,(pt+" "+txt).strip())
+        else: m.append((name,s,e,txt))
+    return m
 
-def format_transcript_lines(attributed: List[Tuple[str, float, float, str]]) -> List[str]:
-    return [f"{(name or 'Unknown')}: {text}" for name, s, e, text in attributed]
+def format_transcript_lines(attributed: List[Tuple[str,float,float,str]]) -> List[str]:
+    return [f"{(n or 'Unknown')}: {t}" for n,s,e,t in attributed]
 
-def ensure_work_dirs(base: Path) -> Tuple[Path, Path]:
+def ensure_work_dirs(base: Path):
     out_dir = base / "out"; temp_dir = base / "temp"
     out_dir.mkdir(parents=True, exist_ok=True); temp_dir.mkdir(parents=True, exist_ok=True)
     return out_dir, temp_dir
