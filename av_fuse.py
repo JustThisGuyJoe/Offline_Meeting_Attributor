@@ -16,7 +16,6 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import cv2
 
-# Optional deps; script degrades gracefully if missing.
 try:
     import pytesseract
 except Exception:
@@ -31,18 +30,15 @@ try:
 except Exception:
     WhisperModel = None
 
-# ==========================
-# CONFIG (edit as needed)
-# ==========================
 CONFIG = {
-    "VISUAL_VIDEO": None,  # Zoom screen-record (visual only)
-    "AUDIO_SOURCE": None,  # Phone video/audio with audio OR audio file
-    "ICS_FILE": None,      # .ics invite
-    "WORK_DIR": None,      # Folder to hold out\ and temp\ (GUI prompts if None)
+    "VISUAL_VIDEO": None,
+    "AUDIO_SOURCE": None,
+    "ICS_FILE": None,
+    "WORK_DIR": None,
 
     "WHISPER_MODEL": "medium",
-    "WHISPER_DEVICE": "cuda",      # "cuda" or "cpu"
-    "WHISPER_COMPUTE": "float16",  # "float16", "int8", ...
+    "WHISPER_DEVICE": "cuda",      # set to "cpu" if you want to test without GPU
+    "WHISPER_COMPUTE": "float16",  # "float16" or "int8" on CPU
 
     "FPS_SAMPLE": 2.0,
     "OCR_ENABLED": True,
@@ -51,45 +47,37 @@ CONFIG = {
     "SNAPSHOT_EVERY": 150,
 }
 
-USE_GUI_DEFAULT = True  # set False to rely solely on CONFIG (and run with --nogui)
+USE_GUI_DEFAULT = True
 
-# ==========================
-# Logging utilities
-# ==========================
+# ----------------- logging -----------------
 _log_file_handle = None
 def _open_log_file(path: Path):
     global _log_file_handle
     try:
         _log_file_handle = path.open("a", encoding="utf-8")
-        _log_file_handle.write(f"===== RUN START {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
-        _log_file_handle.flush()
+        _log_file_handle.write(f"===== RUN START {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n"); _log_file_handle.flush()
     except Exception:
         _log_file_handle = None
 
 def _write_log_file(msg: str):
-    global _log_file_handle
     if _log_file_handle:
         try:
-            _log_file_handle.write(msg + "\n")
-            _log_file_handle.flush()
+            _log_file_handle.write(msg + "\n"); _log_file_handle.flush()
         except Exception:
             pass
 
 def log(msg: str):
-    print(msg, flush=True)
-    _write_log_file(msg)
+    print(msg, flush=True); _write_log_file(msg)
 
 def elog(msg: str):
-    print(msg, file=sys.stderr, flush=True)
-    _write_log_file("[ERR] " + msg)
+    print(msg, file=sys.stderr, flush=True); _write_log_file("[ERR] " + msg)
 
 def close_log():
     global _log_file_handle
     if _log_file_handle:
         try:
             _log_file_handle.write(f"===== RUN END {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
-            _log_file_handle.flush()
-            _log_file_handle.close()
+            _log_file_handle.flush(); _log_file_handle.close()
         except Exception:
             pass
         _log_file_handle = None
@@ -98,28 +86,22 @@ def run(cmd: List[str], check=True) -> subprocess.CompletedProcess:
     elog("> " + " ".join(cmd))
     return subprocess.run(cmd, check=check, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-# ==========================
-# Helpers
-# ==========================
+# ----------------- helpers -----------------
 def is_audio_file(path: Path) -> bool:
     return path.suffix.lower() in {".wav", ".m4a", ".mp3", ".aac", ".flac", ".ogg", ".opus"}
 
-def is_video_file(path: Path) -> bool:
-    return path.suffix.lower() in {".mp4", ".mov", ".mkv", ".avi", ".webm"}
-
 def is_mono_16k_wav(path: Path) -> bool:
-    if path.suffix.lower() != ".wav":
-        return False
-    if "audio16k" in path.stem.lower():
-        return True
+    if path.suffix.lower() != ".wav": return False
+    if "audio16k" in path.stem.lower(): return True
     try:
-        cmd = ["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries",
-               "stream=sample_rate,channels", "-of", "default=nw=1:nk=1", str(path)]
-        proc = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        vals = [v.strip() for v in proc.stdout.splitlines() if v.strip()]
-        if len(vals) >= 2:
-            sr = int(vals[0]); ch = int(vals[1])
-            return (sr == 16000 and ch == 1)
+        proc = subprocess.run(
+            ["ffprobe","-v","error","-select_streams","a:0","-show_entries","stream=sample_rate,channels",
+             "-of","default=nw=1:nk=1", str(path)],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        lines = [l.strip() for l in proc.stdout.splitlines() if l.strip()]
+        if len(lines) >= 2:
+            return (int(lines[0]) == 16000 and int(lines[1]) == 1)
     except Exception:
         pass
     return False
@@ -222,71 +204,48 @@ class TileIdentity:
 
 def hsv_blue_mask(bgr: np.ndarray) -> np.ndarray:
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-    lower1 = np.array([85, 70, 70])
-    upper1 = np.array([130, 255, 255])
-    lower2 = np.array([100, 80, 80])
-    upper2 = np.array([140, 255, 255])
-    m1 = cv2.inRange(hsv, lower1, upper1)
-    m2 = cv2.inRange(hsv, lower2, upper2)
-    return cv2.bitwise_or(m1, m2)
+    lower1 = np.array([85, 70, 70]); upper1 = np.array([130, 255, 255])
+    lower2 = np.array([100, 80, 80]); upper2 = np.array([140, 255, 255])
+    return cv2.bitwise_or(cv2.inRange(hsv, lower1, upper1), cv2.inRange(hsv, lower2, upper2))
 
 def choose_grids() -> List[Tuple[int,int]]:
     return [(3,3), (4,4)]
 
 def tile_border_ring_mask(h: int, w: int, rows: int, cols: int, border_px: int = 10) -> List[np.ndarray]:
-    masks = []
-    th = h // rows
-    tw = w // cols
+    masks = []; th = h // rows; tw = w // cols
     for r in range(rows):
         for c in range(cols):
-            y0, y1 = r*th, min((r+1)*th, h)
-            x0, x1 = c*tw, min((c+1)*tw, w)
-            tile = np.zeros((h, w), dtype=np.uint8)
-            cv2.rectangle(tile, (x0, y0), (x1-1, y1-1), color=255, thickness=border_px)
-            cv2.rectangle(tile, (x0+border_px, y0+border_px), (x1-1-border_px, y1-1-border_px), color=0, thickness=-1)
+            y0,y1 = r*th, min((r+1)*th, h); x0,x1 = c*tw, min((c+1)*tw, w)
+            tile = np.zeros((h,w), dtype=np.uint8)
+            cv2.rectangle(tile,(x0,y0),(x1-1,y1-1),255,border_px)
+            cv2.rectangle(tile,(x0+border_px,y0+border_px),(x1-1-border_px,y1-1-border_px),0,-1)
             masks.append(tile)
     return masks
 
-def tile_bottom_label_roi(h: int, w: int, rows: int, cols: int, band_fraction: float=0.18) -> List[Tuple[int,int,int,int]]:
-    rois = []
-    th = h // rows
-    tw = w // cols
+def tile_bottom_label_roi(h: int, w: int, rows: int, cols: int, band_fraction: float=0.18):
+    rois = []; th = h // rows; tw = w // cols
     for r in range(rows):
         for c in range(cols):
-            y0 = r*th + int(th*(1.0 - band_fraction))
-            y1 = min((r+1)*th, h)
-            x0 = c*tw
-            x1 = min((c+1)*tw, w)
-            rois.append((x0,y0,x1,y1))
+            y0 = r*th + int(th*(1.0 - band_fraction)); y1 = min((r+1)*th, h)
+            x0 = c*tw; x1 = min((c+1)*tw, w); rois.append((x0,y0,x1,y1))
     return rois
 
 def _open_video_with_backoffs(path: Path):
-    # Try default backend
     cap = cv2.VideoCapture(str(path))
-    if cap.isOpened():
-        return cap
-    # Try FFMPEG explicitly
+    if cap.isOpened(): return cap
     cap2 = cv2.VideoCapture(str(path), cv2.CAP_FFMPEG)
-    if cap2.isOpened():
-        return cap2
+    if cap2.isOpened(): return cap2
     return None
 
-def detect_highlight_series(
-    video_path: Path,
-    fps_sample: float,
-    do_ocr: bool,
-    debug_snapshots: bool,
-    snapshot_every: int,
-    temp_dir: Path
-) -> Tuple[List[TileEvent], Dict[int, TileIdentity], Tuple[int,int]]:
+def detect_highlight_series(video_path: Path, fps_sample: float, do_ocr: bool,
+                            debug_snapshots: bool, snapshot_every: int, temp_dir: Path):
     log(f"[Visual] Starting analysis for: {video_path}")
     cap = _open_video_with_backoffs(video_path)
     if cap is None or not cap.isOpened():
-        raise RuntimeError(f"Could not open video (CAP_ANY/FFMPEG both failed): {video_path}")
+        raise RuntimeError(f"Could not open video (CAP_ANY/FFMPEG failed): {video_path}")
     ok, probe = cap.read()
     if not ok or probe is None:
-        cap.release()
-        raise RuntimeError(f"Video opened but first frame read failed: {video_path}")
+        cap.release(); raise RuntimeError("Opened video, but first frame read failed")
     v_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     v_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); v_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -295,101 +254,89 @@ def detect_highlight_series(
 
     step = max(1, int(round(v_fps / max(0.1, fps_sample))))
     grids = choose_grids()
-    best_grid = None; best_score = -1.0
-    best_events = None; best_labels = None
+    best_grid=None; best_score=-1.0; best_events=None; best_labels=None
 
     for (R,C) in grids:
         log(f"[Visual] Trying grid {R}x{C}")
         masks = tile_border_ring_mask(v_h, v_w, R, C, border_px=8)
         rois = tile_bottom_label_roi(v_h, v_w, R, C, band_fraction=0.20)
-        events: List[TileEvent] = []
-        label_samples = {i: [] for i in range(R*C)}
+        events: List[TileEvent] = []; label_samples = {i: [] for i in range(R*C)}
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-        processed = 0; t0 = time.time(); f_idx = 0; snap_count = 0
-
+        processed=0; f_idx=0; t0=time.time(); snap=0
         while True:
             ok, frame = cap.read()
-            if not ok:
-                break
-            if f_idx % step != 0:
-                f_idx += 1; continue
+            if not ok: break
+            if f_idx % step != 0: f_idx += 1; continue
             mask_blue = hsv_blue_mask(frame)
             scores = [int(cv2.countNonZero(cv2.bitwise_and(mask_blue, m))) for m in masks]
-            tile_idx = int(np.argmax(scores))
-            t = f_idx / v_fps
-            events.append(TileEvent(t=t, tile_idx=tile_idx))
-
+            tile_idx = int(np.argmax(scores)); t = f_idx / v_fps
+            events.append(TileEvent(t, tile_idx))
             if do_ocr and pytesseract is not None:
-                (x0,y0,x1,y1) = rois[tile_idx]
+                x0,y0,x1,y1 = rois[tile_idx]
                 band = frame[y0:y1, x0:x1]
                 band = cv2.resize(band, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
                 gray = cv2.cvtColor(band, cv2.COLOR_BGR2GRAY)
                 gray = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)[1]
                 txt = pytesseract.image_to_string(gray, config="--psm 6").strip()
                 txt = re.sub(r"\s+", " ", txt)
-                if txt:
-                    label_samples[tile_idx].append(txt)
-
-            if debug_snapshots and (processed % max(1, snapshot_every) == 0):
-                snap_path = temp_dir / f"debug_frame_{R}x{C}_{snap_count:04d}.jpg"
+                if txt: label_samples[tile_idx].append(txt)
+            if debug_snapshots and (processed % max(1,snapshot_every) == 0):
                 try:
-                    cv2.imwrite(str(snap_path), frame); snap_count += 1
+                    cv2.imwrite(str((temp_dir / f"debug_{R}x{C}_{snap:04d}.jpg")), frame); snap += 1
                 except Exception: pass
-
             f_idx += 1; processed += 1
             if processed % 50 == 0:
                 log(f"[Visual] Grid {R}x{C}: sampled {processed} frames...")
 
         same_runs = sum(1 for i in range(1, len(events)) if events[i].tile_idx == events[i-1].tile_idx)
-        stability = same_runs / max(1, len(events))
+        stability = same_runs / max(1,len(events))
         log(f"[Visual] Grid {R}x{C} stability={stability:.3f} (samples={len(events)}) in {time.time()-t0:.1f}s")
         if stability > best_score:
-            best_score = stability; best_grid = (R, C)
-            best_events = events; best_labels = label_samples
+            best_score = stability; best_grid=(R,C); best_events=events; best_labels=label_samples
 
     identities: Dict[int, TileIdentity] = {}
     R, C = best_grid
     for idx in range(R*C):
         samples = best_labels.get(idx, [])
-        raw = "" if not samples else str(np.unique(np.array(samples), return_counts=True)[0][np.argmax(np.unique(np.array(samples), return_counts=True)[1])])
-        identities[idx] = TileIdentity(idx=idx, label_raw=raw, name_mapped="")
+        if not samples:
+            raw = ""
+        else:
+            vals, cnts = np.unique(np.array(samples), return_counts=True)
+            raw = str(vals[int(np.argmax(cnts))])
+        identities[idx] = TileIdentity(idx, raw, "")
     cap.release()
     log(f"[Visual] Selected grid: {R}x{C} (stability={best_score:.3f})")
-    return best_events, identities, best_grid
+    return best_events, identities, (R,C)
 
 def first_stable_highlight_time(events: List[TileEvent], stable_len: int = 3) -> Optional[float]:
     if not events: return None
-    for i in range(len(events) - stable_len + 1):
+    for i in range(len(events)-stable_len+1):
         tid = events[i].tile_idx
-        if all(events[i+j].tile_idx == tid for j in range(1, stable_len)):
-            return events[i].t
+        if all(events[i+j].tile_idx == tid for j in range(1, stable_len)): return events[i].t
     return events[0].t
 
-def refine_offset_grid(events: List[TileEvent], stt: List[STTSegment], initial_offset: float, search_window: float = 10.0, step: float = 0.1) -> float:
-    change_times = [events[i].t for i in range(1, len(events)) if events[i].tile_idx != events[i-1].tile_idx]
+def refine_offset_grid(events: List[TileEvent], stt: List[STTSegment], initial_offset: float,
+                       search_window: float=10.0, step: float=0.1) -> float:
+    change_times = [events[i].t for i in range(1,len(events)) if events[i].tile_idx != events[i-1].tile_idx]
     seg_starts = [s.start for s in stt]
-    if not change_times or not seg_starts:
-        return initial_offset
+    if not change_times or not seg_starts: return initial_offset
 
     def bin_times(times: List[float]) -> np.ndarray:
         if not times: return np.zeros(1, dtype=int)
-        tmax = max(times) + 1.0; n = int(math.ceil(tmax / 0.25))
+        tmax = max(times)+1.0; n=int(math.ceil(tmax/0.25))
         arr = np.zeros(n, dtype=int)
         for t in times:
-            idx = min(n-1, int(round(t/0.25))); arr[idx] = 1
+            idx = min(n-1, int(round(t/0.25))); arr[idx]=1
         return arr
 
-    vis_bins = bin_times(change_times)
-    best_off = initial_offset; best_score = -1.0
+    vb = bin_times(change_times); best_off=initial_offset; best_score=-1.0
     for off in np.arange(initial_offset - search_window, initial_offset + search_window + 1e-9, step):
-        shifted = [t + off for t in seg_starts]
-        stt_bins = bin_times(shifted)
-        M = max(len(vis_bins), len(stt_bins))
-        vb = np.pad(vis_bins, (0, M - len(vis_bins))); sb = np.pad(stt_bins, (0, M - len(stt_bins)))
-        inter = np.sum((vb==1) & (sb==1)); union = np.sum((vb==1) | (sb==1)) + 1e-6
-        score = inter / union
-        if score > best_score:
-            best_score = score; best_off = float(off)
+        sb = bin_times([t+off for t in seg_starts])
+        M = max(len(vb), len(sb))
+        vb2 = np.pad(vb, (0, M-len(vb))); sb2 = np.pad(sb, (0, M-len(sb)))
+        inter = np.sum((vb2==1) & (sb2==1)); union = np.sum((vb2==1) | (sb2==1)) + 1e-6
+        score = inter/union
+        if score > best_score: best_score=score; best_off=float(off)
     log(f"[Align] initial={initial_offset:.2f}s refined={best_off:.2f}s score={best_score:.3f}")
     return best_off
 
@@ -422,40 +369,34 @@ def ensure_work_dirs(base: Path) -> Tuple[Path, Path]:
 def pick_inputs_with_gui(cfg: dict) -> dict:
     import tkinter as tk
     from tkinter import filedialog
-    root = tk.Tk(); root.withdraw()
+    root=tk.Tk(); root.withdraw()
     if cfg["VISUAL_VIDEO"] is None:
         cfg["VISUAL_VIDEO"] = Path(filedialog.askopenfilename(title="Select Zoom screen recording (visual only)",
-                                                              filetypes=[("Video", "*.mp4 *.mov *.mkv *.avi *.webm")]))
+            filetypes=[("Video","*.mp4 *.mov *.mkv *.avi *.webm")]))
     if cfg["AUDIO_SOURCE"] is None:
         cfg["AUDIO_SOURCE"] = Path(filedialog.askopenfilename(title="Select audio source (video w/ audio OR audio)",
-                                                              filetypes=[("Media", "*.mp4 *.mov *.mkv *.avi *.webm *.wav *.m4a *.mp3 *.aac *.flac *.ogg *.opus")]))
+            filetypes=[("Media","*.mp4 *.mov *.mkv *.avi *.webm *.wav *.m4a *.mp3 *.aac *.flac *.ogg *.opus")]))
     if cfg["ICS_FILE"] is None:
         cfg["ICS_FILE"] = Path(filedialog.askopenfilename(title="Select .ics invite",
-                                                          filetypes=[("iCalendar", "*.ics")]))
+            filetypes=[("iCalendar","*.ics")]))
     if cfg["WORK_DIR"] is None:
         cfg["WORK_DIR"] = Path(filedialog.askdirectory(title="Select Working Folder (will create out/ and temp/)"))
+        # Trick: if you prefer a directory chooser:
+        # cfg["WORK_DIR"] = Path(filedialog.askdirectory(title="Select Working Folder"))
+        # but keep the above if your environment blocks askdirectory dialogs
     root.destroy(); return cfg
 
-def write_outputs(
-    vis_path: Path,
-    aud_src: Path,
-    ics_path: Optional[Path],
-    out_dir: Path,
-    temp_dir: Path,
-    lines: List[str],
-    attendees: List[Attendee],
-    identities: Dict[int, TileIdentity],
-    best_offset: float,
-    stt_segments_count: int,
-    grid_info: Optional[Tuple[int,int]],
-    status: str
-) -> Tuple[Path, Path]:
+def write_outputs(vis_path: Path, aud_src: Path, ics_path: Optional[Path],
+                  out_dir: Path, temp_dir: Path, lines: List[str],
+                  attendees: List[Attendee], identities: Dict[int,TileIdentity],
+                  best_offset: float, stt_segments_count: int,
+                  grid_info: Optional[Tuple[int,int]], status: str):
     base = vis_path.stem + "_fused"
     out_txt = out_dir / f"{base}_attributed_transcript.txt"
     out_json = out_dir / f"{base}_diagnostics.json"
     out_txt.write_text("\n".join(lines), encoding="utf-8")
     diag = {
-        "status": status,  # "stt_only_provisional" | "stt_only" | "success"
+        "status": status,
         "visual_video": str(vis_path),
         "audio_source": str(aud_src),
         "ics": str(ics_path) if ics_path else "",
@@ -508,25 +449,22 @@ def ensure_audio_ready(aud_src: Path, temp_dir: Path) -> Path:
                 target.write_bytes(aud_src.read_bytes())
                 log(f"[Audio] Using existing mono/16k WAV (copied to temp): {target}")
             except Exception:
-                target = aud_src
-                log(f"[Audio] Using existing mono/16k WAV (original): {target}")
+                target = aud_src; log(f"[Audio] Using existing mono/16k WAV (original): {target}")
         else:
             log(f"[Audio] Using existing mono/16k WAV: {target}")
         return target
     out_wav = temp_dir / (aud_src.stem + "_audio16k.wav")
     log(f"[Audio] Extracting/normalizing to WAV: {out_wav}")
-    t0 = time.time()
-    out = extract_audio_to_wav(aud_src, out_wav, sr=16000)
-    log(f"[Audio] WAV ready in {time.time()-t0:.1f}s")
-    return out
+    extract_audio_to_wav(aud_src, out_wav, 16000)
+    log(f"[Audio] WAV ready")
+    return out_wav
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--nogui", action="store_true")
-    args, _ = parser.parse_known_args(argv)
+    parser = argparse.ArgumentParser(add_help=False); parser.add_argument("--nogui", action="store_true")
+    args,_ = parser.parse_known_args(argv)
 
     cfg = dict(CONFIG)
-    if (USE_GUI_DEFAULT and not args.nogui):
+    if USE_GUI_DEFAULT and not args.nogui:
         cfg = pick_inputs_with_gui(cfg)
 
     vis_path = Path(cfg["VISUAL_VIDEO"]) if cfg["VISUAL_VIDEO"] else None
