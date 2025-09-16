@@ -499,16 +499,13 @@ def detect_highlight_series(video_path: Path, fps_sample: float, do_ocr: bool,
             best_events = events
             best_labels = label_samples
 
-    # ---- after trying all grids, we pick identities using the chosen grid ----
+    # identities from best grid
     identities: Dict[int, TileIdentity] = {}
     R, C = best_grid
     for idx in range(R*C):
         samples = best_labels.get(idx, [])
-        if not samples:
-            raw = ""
-        else:
-            vals, cnts = np.unique(np.array(samples), return_counts=True)
-            raw = str(vals[int(np.argmax(cnts))])
+        raw = "" if not samples else str(np.unique(np.array(samples), return_counts=True)[0]
+                                         [int(np.argmax(np.unique(np.array(samples), return_counts=True)[1]))])
         identities[idx] = TileIdentity(idx, raw, "")
     cap.release()
     log(f"[Visual] Selected grid: {R}x{C} (stability={best_score:.3f})")
