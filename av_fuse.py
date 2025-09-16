@@ -26,40 +26,50 @@ except Exception:
     WhisperModel = None
 
 CONFIG = {
+    # set these to None to use the GUI pickers
     "VISUAL_VIDEO": None,
     "AUDIO_SOURCE": None,
     "ICS_FILE": None,
     "WORK_DIR": None,
 
+    # STT
     "WHISPER_MODEL": "medium",
-    "WHISPER_DEVICE": "cuda",      # set to "cpu" if you want to test without GPU
-    "WHISPER_COMPUTE": "float16",  # "float16" or "int8" on CPU
+    "WHISPER_DEVICE": "cuda",      # "cuda" or "cpu"
+    "WHISPER_COMPUTE": "float16",  # "float16" or "int8" (cpu)
 
+    # Visual
     "FPS_SAMPLE": 2.0,
     "OCR_ENABLED": True,
 
     "DEBUG_SNAPSHOTS": False,
     "SNAPSHOT_EVERY": 150,
 
-    # NEW: manual tile -> name overrides (use tile index, zero-based)
+    # Manual tile -> name overrides (0-based index)
     "TILE_NAME_OVERRIDES": {
-        # 14: "Tyler Lastname",
-        # 7: "Justin Lastname",
+        # 4: "Austin Thomas",
+        # 8: "JC Nordyke",
     },
 
-    # NEW: crop away UI bars (pixels). Tune if needed.
+    # Crop away global UI bars (pixels)
     "CANVAS_CROP": {"top": 80, "bottom": 80, "left": 0, "right": 0},
 
-    # NEW: optionally force the grid layout. Set to (3,3) for Teams gallery.
-    # Leave as None to auto-try both.
-    "FORCE_GRID": None,  # e.g., (3,3)
+    # Force grid (3,3 for Teams). Set to None to let it try [(3,3),(4,4)].
+    "FORCE_GRID": (3, 3),
 
-        # NEW:
-    "AUTO_INNER_DETECT": True,     # try to find the gallery sub-rectangle
-    "AUTO_INNER_MAX_SHRINK": 0.20, # don't trim more than 20% from any side
+    # Auto-detect inner gallery rectangle (handles maximized window vs fullscreen)
+    "AUTO_INNER_DETECT": True,
+    "AUTO_INNER_MAX_SHRINK": 0.10,   # <=10% per side, conservative
+
+    # OCR: read the *bottom-left* name bar only (avoid avatar initials)
+    "LABEL_LEFT_FRAC": 0.48,         # left portion width inside tile
+    "LABEL_HEIGHT_FRAC": 0.14,       # bottom band height inside tile
+    "OCR_MIN_TOKENS": 2,
+    "OCR_MAX_TOKENS": 3,
+    "TESS_CONFIG": "--psm 7 -l eng", # psm 7 = single text line (fits name bar)
+
+    # ICS fuzz cutoff
+    "FUZZ_CUTOFF": 78,               # slightly looser to catch Egolf/Gabriel, etc.
 }
-# Optional: force Teams layout for this run
-CONFIG["FORCE_GRID"] = (3, 3)
 
 USE_GUI_DEFAULT = True
 
@@ -101,9 +111,6 @@ def run(cmd: List[str], check=True) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, check=check, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
 # ----------------- helpers -----------------
-def is_audio_file(path: Path) -> bool:
-    return path.suffix.lower() in {".wav", ".m4a", ".mp3", ".aac", ".flac", ".ogg", ".opus"}
-
 def is_mono_16k_wav(path: Path) -> bool:
     if path.suffix.lower() != ".wav": return False
     if "audio16k" in path.stem.lower(): return True
@@ -134,65 +141,40 @@ def _crop_canvas(frame: np.ndarray, crop: Dict[str,int]) -> Tuple[np.ndarray, Tu
     x0 = min(max(0, l), w-1); x1 = max(x0+1, w - max(0, r))
     return frame[y0:y1, x0:x1].copy(), (x0, y0)
 
-def _auto_inner_rect(frame_c: np.ndarray, max_shrink_pct: float = 0.20) -> Tuple[int,int,int,int]:
-    """
-    Find an inner rectangle likely to be the 3x3 gallery by looking for
-    columns/rows with higher texture/variance and trimming low-variance margins.
-    Returns (x0, y0, x1, y1) in coordinates of frame_c.
-    """
+# NEW: edge-based inner gallery detection (very conservative)
+def _auto_inner_rect_edges(frame_c: np.ndarray, max_shrink_pct: float = 0.10) -> Tuple[int,int,int,int]:
     h, w = frame_c.shape[:2]
     if h < 200 or w < 200:
         return 0, 0, w, h
+
     gray = cv2.cvtColor(frame_c, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (0,0), 1.0)
+    gray = cv2.GaussianBlur(gray, (3,3), 0.8)
+    edges = cv2.Canny(gray, 40, 120)
+    # make borders continuous
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (7,7))
+    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, k, iterations=2)
 
-    col_std = gray.std(axis=0).astype(np.float32)  # length w
-    row_std = gray.std(axis=1).astype(np.float32)  # length h
-    tc = float(col_std.max()) * 0.25
-    tr = float(row_std.max()) * 0.25
-    xs = np.where(col_std > tc)[0]
-    ys = np.where(row_std > tr)[0]
-    if xs.size < 10 or ys.size < 10:
+    # find the largest contour (likely the gallery block)
+    cnts,_ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
         return 0, 0, w, h
+    cnt = max(cnts, key=cv2.contourArea)
+    x,y,ww,hh = cv2.boundingRect(cnt)
 
-    x0, x1 = int(xs[0]), int(xs[-1]) + 1
-    y0, y1 = int(ys[0]), int(ys[-1]) + 1
+    # restrict shrink
+    max_dx = int(w * max_shrink_pct); max_dy = int(h * max_shrink_pct)
+    x0 = max(0, min(x, max_dx))
+    y0 = max(0, min(y, max_dy))
+    x1 = min(w, max(x+ww, w - max_dx))
+    y1 = min(h, max(y+hh, h - max_dy))
 
-    # limit how much we can shrink from any side
-    max_dx = int(w * max_shrink_pct)
-    max_dy = int(h * max_shrink_pct)
-    x0 = max(0, min(x0, max_dx))
-    y0 = max(0, min(y0, max_dy))
-    x1 = min(w, max(x1, w - max_dx))
-    y1 = min(h, max(y1, h - max_dy))
-
-    # small padding to avoid cutting border pixels
-    pad = 4
-    x0 = max(0, x0 - pad); y0 = max(0, y0 - pad)
-    x1 = min(w, x1 + pad); y1 = min(h, y1 + pad)
-
-    # ensure minimum size
-    if (x1 - x0) < 300 or (y1 - y0) < 300:
+    # ensure reasonable area
+    if (x1-x0) < w*0.6 or (y1-y0) < h*0.5:
         return 0, 0, w, h
     return x0, y0, x1, y1
 
-def _apply_inner_rect(frame_c: np.ndarray, rect: Tuple[int,int,int,int]) -> np.ndarray:
-    x0, y0, x1, y1 = rect
-    return frame_c[y0:y1, x0:x1]
-
-def _crop_canvas(frame: np.ndarray, crop: Dict[str,int]) -> Tuple[np.ndarray, Tuple[int,int]]:
-    t = int(crop.get("top", 0)); b = int(crop.get("bottom", 0))
-    l = int(crop.get("left", 0)); r = int(crop.get("right", 0))
-    h, w = frame.shape[:2]
-    y0 = min(max(0, t), h-1); y1 = max(y0+1, h - max(0, b))
-    x0 = min(max(0, l), w-1); x1 = max(x0+1, w - max(0, r))
-    return frame[y0:y1, x0:x1].copy(), (x0, y0)
-
-# NEW: derive a human name from an email local part (first.last → First Last)
+# Email → friendly name
 def _name_from_email(addr: str) -> str:
-    """
-    Convert 'first.last@domain' into 'First Last'. Returns '' if cannot parse.
-    """
     if not addr or "@" not in addr:
         return ""
     local = addr.split("@", 1)[0]
