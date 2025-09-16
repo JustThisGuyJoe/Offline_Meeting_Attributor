@@ -60,6 +60,10 @@ CONFIG = {
     # NEW: optionally force the grid layout. Set to (3,3) for Teams gallery.
     # Leave as None to auto-try both.
     "FORCE_GRID": None,  # e.g., (3,3)
+
+        # NEW:
+    "AUTO_INNER_DETECT": True,     # try to find the gallery sub-rectangle
+    "AUTO_INNER_MAX_SHRINK": 0.20, # don't trim more than 20% from any side
 }
 # Optional: force Teams layout for this run
 CONFIG["FORCE_GRID"] = (3, 3)
@@ -137,21 +141,59 @@ def _crop_canvas(frame: np.ndarray, crop: Dict[str,int]) -> Tuple[np.ndarray, Tu
     x0 = min(max(0, l), w-1); x1 = max(x0+1, w - max(0, r))
     return frame[y0:y1, x0:x1].copy(), (x0, y0)
 
-def highlight_mask(bgr: np.ndarray) -> np.ndarray:
+def _auto_inner_rect(frame_c: np.ndarray, max_shrink_pct: float = 0.20) -> Tuple[int,int,int,int]:
     """
-    Border mask that works for both Zoom (blue) and Teams (white).
+    Find an inner rectangle likely to be the 3x3 gallery by looking for
+    columns/rows with higher texture/variance and trimming low-variance margins.
+    Returns (x0, y0, x1, y1) in coordinates of frame_c.
     """
-    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-    # blue-ish ring (Zoom)
-    lower1 = np.array([85, 70, 70]); upper1 = np.array([130, 255, 255])
-    lower2 = np.array([100, 80, 80]); upper2 = np.array([140, 255, 255])
-    blue = cv2.bitwise_or(cv2.inRange(hsv, lower1, upper1), cv2.inRange(hsv, lower2, upper2))
-    # white/bright ring (Teams)
-    v = hsv[:, :, 2]; s = hsv[:, :, 1]
-    bright = cv2.inRange(v, 220, 255)
-    low_sat = cv2.inRange(s, 0, 60)
-    white = cv2.bitwise_and(bright, low_sat)
-    return cv2.bitwise_or(blue, white)
+    h, w = frame_c.shape[:2]
+    if h < 200 or w < 200:
+        return 0, 0, w, h
+    gray = cv2.cvtColor(frame_c, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (0,0), 1.0)
+
+    col_std = gray.std(axis=0).astype(np.float32)  # length w
+    row_std = gray.std(axis=1).astype(np.float32)  # length h
+    tc = float(col_std.max()) * 0.25
+    tr = float(row_std.max()) * 0.25
+    xs = np.where(col_std > tc)[0]
+    ys = np.where(row_std > tr)[0]
+    if xs.size < 10 or ys.size < 10:
+        return 0, 0, w, h
+
+    x0, x1 = int(xs[0]), int(xs[-1]) + 1
+    y0, y1 = int(ys[0]), int(ys[-1]) + 1
+
+    # limit how much we can shrink from any side
+    max_dx = int(w * max_shrink_pct)
+    max_dy = int(h * max_shrink_pct)
+    x0 = max(0, min(x0, max_dx))
+    y0 = max(0, min(y0, max_dy))
+    x1 = min(w, max(x1, w - max_dx))
+    y1 = min(h, max(y1, h - max_dy))
+
+    # small padding to avoid cutting border pixels
+    pad = 4
+    x0 = max(0, x0 - pad); y0 = max(0, y0 - pad)
+    x1 = min(w, x1 + pad); y1 = min(h, y1 + pad)
+
+    # ensure minimum size
+    if (x1 - x0) < 300 or (y1 - y0) < 300:
+        return 0, 0, w, h
+    return x0, y0, x1, y1
+
+def _apply_inner_rect(frame_c: np.ndarray, rect: Tuple[int,int,int,int]) -> np.ndarray:
+    x0, y0, x1, y1 = rect
+    return frame_c[y0:y1, x0:x1]
+
+def _crop_canvas(frame: np.ndarray, crop: Dict[str,int]) -> Tuple[np.ndarray, Tuple[int,int]]:
+    t = int(crop.get("top", 0)); b = int(crop.get("bottom", 0))
+    l = int(crop.get("left", 0)); r = int(crop.get("right", 0))
+    h, w = frame.shape[:2]
+    y0 = min(max(0, t), h-1); y1 = max(y0+1, h - max(0, b))
+    x0 = min(max(0, l), w-1); x1 = max(x0+1, w - max(0, r))
+    return frame[y0:y1, x0:x1].copy(), (x0, y0)
 
 # NEW: derive a human name from an email local part (first.last → First Last)
 def _name_from_email(addr: str) -> str:
@@ -632,7 +674,11 @@ def _save_grid_preview(video_path: Path, grid: Tuple[int,int], out_path: Path, s
     cap.release()
     if not ok or frame is None:
         return
-    frame_c, _off = _crop_canvas(frame, CONFIG.get("CANVAS_CROP", {}))
+    frame_c, _ = _crop_canvas(frame, CONFIG.get("CANVAS_CROP", {}))
+    if CONFIG.get("AUTO_INNER_DETECT", True):
+        x0,y0,x1,y1 = _auto_inner_rect(frame_c, CONFIG.get("AUTO_INNER_MAX_SHRINK", 0.20))
+        frame_c = frame_c[y0:y1, x0:x1]
+
     R, C = grid
     h, w = frame_c.shape[:2]
     th = h // R; tw = w // C
