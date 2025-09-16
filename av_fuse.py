@@ -129,6 +129,44 @@ class Attendee:
     email: str = ""
     company: str = ""
 
+def _crop_canvas(frame: np.ndarray, crop: Dict[str,int]) -> Tuple[np.ndarray, Tuple[int,int]]:
+    t = int(crop.get("top", 0)); b = int(crop.get("bottom", 0))
+    l = int(crop.get("left", 0)); r = int(crop.get("right", 0))
+    h, w = frame.shape[:2]
+    y0 = min(max(0, t), h-1); y1 = max(y0+1, h - max(0, b))
+    x0 = min(max(0, l), w-1); x1 = max(x0+1, w - max(0, r))
+    return frame[y0:y1, x0:x1].copy(), (x0, y0)
+
+def highlight_mask(bgr: np.ndarray) -> np.ndarray:
+    """
+    Border mask that works for both Zoom (blue) and Teams (white).
+    """
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    # blue-ish ring (Zoom)
+    lower1 = np.array([85, 70, 70]); upper1 = np.array([130, 255, 255])
+    lower2 = np.array([100, 80, 80]); upper2 = np.array([140, 255, 255])
+    blue = cv2.bitwise_or(cv2.inRange(hsv, lower1, upper1), cv2.inRange(hsv, lower2, upper2))
+    # white/bright ring (Teams)
+    v = hsv[:, :, 2]; s = hsv[:, :, 1]
+    bright = cv2.inRange(v, 220, 255)
+    low_sat = cv2.inRange(s, 0, 60)
+    white = cv2.bitwise_and(bright, low_sat)
+    return cv2.bitwise_or(blue, white)
+
+# NEW: derive a human name from an email local part (first.last → First Last)
+def _name_from_email(addr: str) -> str:
+    """
+    Convert 'first.last@domain' into 'First Last'. Returns '' if cannot parse.
+    """
+    if not addr or "@" not in addr:
+        return ""
+    local = addr.split("@", 1)[0]
+    parts = re.split(r"[._+\-]+", local)
+    parts = [p for p in parts if p and p.isalpha()]
+    if len(parts) < 2:
+        return ""
+    return " ".join(w.capitalize() for w in parts[:3])
+
 def parse_ics_attendees(p: Path) -> List[Attendee]:
     out: List[Attendee] = []
     if not p or not p.exists(): return out
@@ -141,6 +179,11 @@ def parse_ics_attendees(p: Path) -> List[Attendee]:
             m2 = re.search(r":mailto:([^ \r\n]+)", L, flags=re.I)
             name = (m1.group(1).strip() if m1 else "").replace(r"\,", ",").strip('"')
             email = (m2.group(1).strip() if m2 else "")
+            # Normalize CN when blank or looks like an email
+            if (not name) or ("@" in name):
+                derived = _name_from_email(email or name)
+                if derived:
+                    name = derived
             out.append(Attendee(name=name, email=email, company=""))
         elif L.upper().startswith("ORGANIZATION:") or L.upper().startswith("ORG:"):
             org = L.split(":",1)[-1].strip()
@@ -160,6 +203,82 @@ def best_icsonym_match(raw: str, icsonyms: List[str]) -> Optional[str]:
     for can in icsonyms:
         if s.lower() == can.lower(): return can
     return s
+
+# --- Name sanity filters for OCR → ICS mapping ---
+STOPWORDS = {
+    "inbox", "zoom", "workplace", "screen", "sharing", "snipping", "tool",
+    "client", "secure", "entry", "external", "meeting", "recording",
+    "cod", "windows", "mail", "outlook"
+}
+
+def _is_plausible_person_name(txt: str) -> bool:
+    if not txt:
+        return False
+    s = txt.strip()
+    low = s.lower()
+    if any(w in low for w in STOPWORDS):
+        return False
+    if "@" in s or "|" in s or "#" in s:
+        return False
+    # keep only letters, spaces, hyphens, apostrophes
+    cleaned = re.sub(r"[^A-Za-z \-']", " ", s)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if not cleaned:
+        return False
+    tokens = cleaned.split()
+    # typical display names are 2–3 tokens
+    if len(tokens) < 2 or len(tokens) > 3:
+        return False
+    # require tokens to be capitalized words (e.g., "John", "O'Neil")
+    cap_like = sum(1 for t in tokens if re.match(r"^[A-Z][a-z'\-]+$", t))
+    return cap_like >= 2
+
+def clean_ocr_name(raw: str) -> str:
+    """Return a cleaned candidate name or '' if it's not plausibly a person name."""
+    if not raw:
+        return ""
+    s = re.sub(r"\s+", " ", raw).strip()
+    if not _is_plausible_person_name(s):
+        return ""
+    s = re.sub(r"[^A-Za-z \-']", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return " ".join(w[0].upper() + w[1:] if w else w for w in s.split(" "))
+
+def strict_map_to_ics(ocr_name: str, attendees: List[Attendee], cutoff: int = 88) -> str:
+    """
+    Map a plausible OCR name to an ICS attendee only if:
+      - fuzzy score is high (>= cutoff), AND
+      - both first and last tokens from OCR appear in the ICS name.
+    Otherwise return '' (decline mapping).
+    """
+    if not ocr_name or not attendees:
+        return ""
+    icsonyms = [a.name for a in attendees if a.name]
+    if not icsonyms:
+        return ""
+    toks = [t for t in ocr_name.split() if len(t) >= 2]
+    if len(toks) < 2:
+        return ""
+    first, last = toks[0].lower(), toks[-1].lower()
+
+    best = None
+    best_score = -1
+    if process and fuzz:
+        cand, score, _ = process.extractOne(ocr_name, icsonyms, scorer=fuzz.WRatio)
+        best, best_score = cand, score
+    else:
+        for cand in icsonyms:
+            if ocr_name.lower() == cand.lower():
+                best, best_score = cand, 100
+                break
+
+    if not best or best_score < cutoff:
+        return ""
+
+    btoks = [t.lower() for t in re.findall(r"[A-Za-z]+", best)]
+    if first in btoks and last in btoks:
+        return best
+    return ""
 
 def extract_audio_to_wav(src: Path, out_wav: Path, sr: int = 16000) -> Path:
     out_wav.parent.mkdir(parents=True, exist_ok=True)
@@ -349,10 +468,13 @@ def refine_offset_grid(events: List[TileEvent], stt: List[STTSegment], initial_o
     return best_off
 
 def map_identities_to_ics(identities: Dict[int, TileIdentity], attendees: List[Attendee]) -> Dict[int, TileIdentity]:
-    icsonyms = [a.name for a in attendees if a.name]
     for idx, ident in identities.items():
-        mapped = best_icsonym_match(ident.label_raw, icsonyms) if icsonyms else ident.label_raw
-        identities[idx] = TileIdentity(idx, ident.label_raw, mapped or ident.label_raw)
+        raw = (ident.label_raw or "").strip()
+        if not _is_plausible_person_name(raw):
+            identities[idx] = TileIdentity(idx, raw, "")
+            continue
+        mapped = strict_map_to_ics(raw, attendees, cutoff=88)
+        identities[idx] = TileIdentity(idx, raw, mapped)
     return identities
 
 def merge_consecutive_segments(attributed: List[Tuple[str,float,float,str]]) -> List[Tuple[str,float,float,str]]:
