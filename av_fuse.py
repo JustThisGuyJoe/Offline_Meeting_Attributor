@@ -1,17 +1,14 @@
 #!/usr/bin/env python3
-# av_fuse.py  — V1.0.5
+# av_fuse.py — V1.0.6
 #
-# Changes vs V1.0.4:
-# - Writes provisional STT-only transcript + diagnostics immediately after STT,
-#   then upgrades them on success.
-# - Registers an atexit emergency writer to dump STT-only outputs if the process
-#   terminates after STT but before we’ve written files.
-# - Visual preflight tries CAP_ANY and CAP_FFMPEG.
-# - Extra prints between STT and Visual steps.
+# Fixes vs V1.0.5:
+# - Keep Whisper model alive globally to avoid CUDA/CTranslate2 destructor crashes after STT.
+# - Provisional STT-only write happens immediately after STT (then upgrade on success).
+# - atexit emergency writer remains as last resort.
 #
 from __future__ import annotations
 
-import argparse, atexit, json, math, os, re, subprocess, sys, time, traceback
+import argparse, atexit, json, math, os, re, subprocess, sys, time, traceback, gc
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -190,17 +187,25 @@ class STTSegment:
     end: float
     text: str
 
-def transcribe_wav_fwhisper(wav_path: Path, model_size: str, device: str, compute_type: str) -> List[STTSegment]:
+# --------- GLOBAL Whisper model cache ----------
+_WHISPER_MODEL = None
+def _get_whisper(model_size: str, device: str, compute_type: str):
+    global _WHISPER_MODEL
     if WhisperModel is None:
-        raise ImportError("faster-whisper is not installed. pip install faster-whisper")
-    log(f"[STT] Loading Whisper model: {model_size} ({device}/{compute_type})")
-    model = WhisperModel(model_size, device=device, compute_type=compute_type)
+        raise ImportError("faster-whisper not installed")
+    if _WHISPER_MODEL is None:
+        log(f"[STT] Loading Whisper model once: {model_size} ({device}/{compute_type})")
+        _WHISPER_MODEL = WhisperModel(model_size, device=device, compute_type=compute_type)
+    return _WHISPER_MODEL
+
+def transcribe_wav_fwhisper(wav_path: Path, model_size: str, device: str, compute_type: str) -> List[STTSegment]:
+    model = _get_whisper(model_size, device, compute_type)
     segments: List[STTSegment] = []
     opts = dict(beam_size=5, vad_filter=True, vad_parameters=dict(min_silence_duration_ms=500))
     t0 = time.time()
     it, _info = model.transcribe(str(wav_path), **opts)
     for seg in it:
-        segments.append(STTSegment(start=float(seg.start), end=float(seg.end), text=seg.text.strip()))
+        segments.append(STTSegment(float(seg.start), float(seg.end), seg.text.strip()))
     log(f"[STT] Done. Segments: {len(segments)} in {time.time()-t0:.1f}s")
     return segments
 
@@ -529,75 +534,57 @@ def main(argv=None):
     ics_path = Path(cfg["ICS_FILE"]) if cfg["ICS_FILE"] else None
     work_dir = Path(cfg["WORK_DIR"]) if cfg["WORK_DIR"] else None
 
-    log("[FILES] Visual: " + (str(vis_path) if vis_path else "<none>"))
-    log("[FILES] Audio:  " + (str(aud_src) if aud_src else "<none>"))
-    log("[FILES] ICS:    " + (str(ics_path) if ics_path else "<none>"))
+    print("[FILES] Visual:", vis_path or "<none>")
+    print("[FILES] Audio: ", aud_src or "<none>")
+    print("[FILES] ICS:   ", ics_path or "<none>")
 
-    if not vis_path or not vis_path.exists():
-        raise FileNotFoundError("Missing VISUAL_VIDEO. Set CONFIG['VISUAL_VIDEO'] or use GUI.")
-    if not aud_src or not aud_src.exists():
-        raise FileNotFoundError("Missing AUDIO_SOURCE. Set CONFIG['AUDIO_SOURCE'] or use GUI.")
-    if not work_dir:
-        raise FileNotFoundError("Missing WORK_DIR. Set CONFIG['WORK_DIR'] or use GUI.")
+    if not vis_path or not vis_path.exists(): raise FileNotFoundError("Missing VISUAL_VIDEO")
+    if not aud_src or not aud_src.exists():  raise FileNotFoundError("Missing AUDIO_SOURCE")
+    if not work_dir:                         raise FileNotFoundError("Missing WORK_DIR")
 
     out_dir, temp_dir = ensure_work_dirs(work_dir)
-    run_log_path = out_dir / (vis_path.stem + "_run.log")
-    _open_log_file(run_log_path)
+    run_log_path = out_dir / (vis_path.stem + "_run.log"); _open_log_file(run_log_path)
 
     log(f"[Paths] Work: {work_dir}")
     log(f"[Paths] Out:  {out_dir}")
     log(f"[Paths] Temp: {temp_dir}")
 
-    attendees = []
-    if ics_path and ics_path.exists():
-        attendees = parse_ics_attendees(ics_path)
-        log(f"[ICS] Loaded attendees: {len(attendees)}")
-    else:
-        log("[ICS] No .ics provided; will use OCR labels directly.")
+    attendees = parse_ics_attendees(ics_path) if (ics_path and ics_path.exists()) else []
+    log(f"[ICS] Loaded attendees: {len(attendees)}")
 
-    # Audio → WAV (skip if already good)
     wav_path = ensure_audio_ready(aud_src, temp_dir)
 
-    # STT
-    stt_segments = transcribe_wav_fwhisper(
-        wav_path,
-        model_size=cfg["WHISPER_MODEL"],
-        device=cfg["WHISPER_DEVICE"],
-        compute_type=cfg["WHISPER_COMPUTE"]
-    )
+    # ---- STT ----
+    stt_segments = transcribe_wav_fwhisper(wav_path, cfg["WHISPER_MODEL"], cfg["WHISPER_DEVICE"], cfg["WHISPER_COMPUTE"])
     if not stt_segments:
-        log("[STT] No segments produced—writing empty transcript and exiting.")
-        write_outputs(vis_path, aud_src, ics_path, out_dir, temp_dir, [], attendees, {}, 0.0, 0, None, status="stt_only")
+        log("[STT] No segments — writing empty transcript.")
+        write_outputs(vis_path, aud_src, ics_path, out_dir, temp_dir, [], attendees, {}, 0.0, 0, None, "stt_only")
         close_log(); return 2
 
-    # Enable atexit emergency writer now that we have STT
-    _emergency.update({
-        "enabled": True, "vis_path": vis_path, "aud_src": aud_src, "ics_path": ics_path,
-        "out_dir": out_dir, "temp_dir": temp_dir, "attendees": attendees, "stt_segments": stt_segments,
-    })
+    # enable atexit emergency now that we have STT
+    _emergency.update({"enabled": True, "vis_path": vis_path, "aud_src": aud_src, "ics_path": ics_path,
+                       "out_dir": out_dir, "temp_dir": temp_dir, "attendees": attendees, "stt_segments": stt_segments})
 
-    # === PROVISIONAL WRITE after STT ===
+    # Provisional write
     provisional_lines = [f"Unknown: {s.text}" for s in stt_segments]
-    write_outputs(vis_path, aud_src, ics_path, out_dir, temp_dir, provisional_lines,
-                  attendees, {}, 0.0, len(stt_segments), None, status="stt_only_provisional")
-    log("[Checkpoint] Provisional STT-only transcript+diagnostics written. Proceeding to visual...")
+    write_outputs(vis_path, aud_src, ics_path, out_dir, temp_dir, provisional_lines, attendees, {}, 0.0, len(stt_segments), None, "stt_only_provisional")
+    log("[Checkpoint] Provisional transcript+diagnostics written. Proceeding to visual...")
 
-    # VISUAL Preflight with backoffs
+    # ---- VISUAL PREFLIGHT ----
     log("[Visual] Preflight: opening video...")
-    test_cap = _open_video_with_backoffs(vis_path)
-    if test_cap is None or not test_cap.isOpened():
-        log(f"[Visual][ERROR] Cannot open video with CAP_ANY/FFMPEG: {vis_path}")
+    cap0 = _open_video_with_backoffs(vis_path)
+    if cap0 is None or not cap0.isOpened():
+        log(f"[Visual][ERROR] Cannot open video: {vis_path}")
         close_log(); return 4
-    ok, frm0 = test_cap.read()
-    test_cap.release()
-    if not ok or frm0 is None:
-        log(f"[Visual][ERROR] Opened but first frame read failed: {vis_path}")
+    ok, first = cap0.read(); cap0.release()
+    if not ok or first is None:
+        log(f"[Visual][ERROR] First frame read failed: {vis_path}")
         close_log(); return 5
     log("[Visual] Preflight OK; starting detection...")
 
-    # VISUAL Detection
+    # ---- VISUAL DETECTION ----
     try:
-        events, identities, grid_info = detect_highlight_series(
+        events, identities, grid = detect_highlight_series(
             vis_path,
             fps_sample=float(cfg["FPS_SAMPLE"]),
             do_ocr=bool(cfg["OCR_ENABLED"] and pytesseract is not None),
@@ -606,49 +593,47 @@ def main(argv=None):
             temp_dir=temp_dir
         )
     except Exception as ex:
-        elog("[Visual][FATAL] Exception in detection: " + str(ex))
-        traceback.print_exc()
+        elog("[Visual][FATAL] " + str(ex)); traceback.print_exc()
         close_log(); return 6
 
     if not events:
-        log("[Visual] No highlight events detected—keeping STT-only transcript.")
+        log("[Visual] No highlight events — keeping STT-only.")
         close_log(); return 3
 
-    R, C = grid_info
+    R,C = grid
     log(f"[Visual] Events: {len(events)}, Grid: {R}x{C}")
 
-    # Map OCR -> ICS
     identities = map_identities_to_ics(identities, attendees)
 
-    # Offset estimate + refine
     t_vis0 = first_stable_highlight_time(events) or 0.0
     t_aud0 = stt_segments[0].start
     initial = t_vis0 - t_aud0
-    log(f"[Align] Initial guess offset = visual({t_vis0:.2f}) - audio({t_aud0:.2f}) = {initial:.2f}s")
-    best_offset = refine_offset_grid(events, stt_segments, initial_offset=initial, search_window=10.0, step=0.1)
+    log(f"[Align] Initial offset = {initial:.2f}s")
+    best_offset = refine_offset_grid(events, stt_segments, initial, search_window=10.0, step=0.1)
 
-    # Attribute
     times_arr = np.array([ev.t for ev in events], dtype=np.float32)
     tiles_arr = np.array([ev.tile_idx for ev in events], dtype=np.int16)
-    attributed: List[Tuple[str, float, float, str]] = []
+
+    attributed: List[Tuple[str,float,float,str]] = []
     for seg in stt_segments:
         t_vis = seg.start + best_offset
-        idx = np.searchsorted(times_arr, t_vis, side="right") - 1
-        idx = int(np.clip(idx, 0, len(times_arr)-1))
-        tidx = int(tiles_arr[idx])
-        ident = identities.get(tidx)
+        idx = int(np.clip(np.searchsorted(times_arr, t_vis, side="right") - 1, 0, len(times_arr)-1))
+        tidx = int(tiles_arr[idx]); ident = identities.get(tidx)
         name = (ident.name_mapped or ident.label_raw or f"Tile{tidx+1}") if ident else f"Tile{tidx+1}"
         attributed.append((name, seg.start, seg.end, seg.text))
 
-    # Merge + write final
     attributed = merge_consecutive_segments(attributed)
     final_lines = format_transcript_lines(attributed)
-    write_outputs(
-        vis_path, aud_src, ics_path, out_dir, temp_dir,
-        final_lines, attendees, identities, best_offset,
-        len(stt_segments), grid_info, status="success"
-    )
+    write_outputs(vis_path, aud_src, ics_path, out_dir, temp_dir, final_lines, attendees, identities, best_offset, len(stt_segments), (R,C), "success")
     log(f"[DONE] Attributed lines: {len(final_lines)}")
+
+    # prevent clobbering success files on process exit
+    _emergency["enabled"] = False
+    log("[Success] Final outputs written; emergency atexit disabled.")
+    # Optional: release model only after success writes
+    # (If you see crashes at program end, leave it alive.)
+    # global _WHISPER_MODEL; _WHISPER_MODEL = None; gc.collect()
+
     close_log()
     return 0
 
