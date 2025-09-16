@@ -369,15 +369,24 @@ def tile_border_ring_mask(h: int, w: int, rows: int, cols: int, border_px: int =
             masks.append(tile)
     return masks
 
-# ---- name-bar ROI: bottom-left corner inside each tile ----
-def tile_namebar_rois(h: int, w: int, rows: int, cols: int, left_frac: float, height_frac: float) -> List[Tuple[int,int,int,int]]:
-    rois = []; th = h // rows; tw = w // cols
+# ---- dual name-bar ROIs: bottom-left AND top-left ----
+def tile_namebar_rois_dual(h: int, w: int, rows: int, cols: int, left_frac: float,
+                           top_frac: float, bottom_frac: float) -> Tuple[List[Tuple[int,int,int,int]],
+                                                                         List[Tuple[int,int,int,int]]]:
+    top_rois, bot_rois = [], []
+    th = h // rows; tw = w // cols
     for r in range(rows):
         for c in range(cols):
-            y1 = min((r+1)*th, h); y0 = max(r*th, int(y1 - th*height_frac))
-            x0 = c*tw; x1 = min((c+1)*tw, int(c*tw + tw*left_frac))
-            rois.append((x0,y0,x1,y1))
-    return rois
+            # top band
+            y0t = r*th; y1t = min((r+1)*th, int(r*th + th*top_frac))
+            x0t = c*tw; x1t = min((c+1)*tw, int(c*tw + tw*left_frac))
+            top_rois.append((x0t, y0t, x1t, y1t))
+            # bottom band
+            y1b = min((r+1)*th, (r+1)*th)
+            y0b = max(r*th, int((r+1)*th - th*bottom_frac))
+            x0b = c*tw; x1b = min((c+1)*tw, int(c*tw + tw*left_frac))
+            bot_rois.append((x0b, y0b, x1b, y1b))
+    return top_rois, bot_rois
 
 def _open_video_with_backoffs(path: Path):
     cap = cv2.VideoCapture(str(path))
@@ -415,15 +424,18 @@ def detect_highlight_series(video_path: Path, fps_sample: float, do_ocr: bool,
         frame_c0, _ = _crop_canvas(probe, CONFIG.get("CANVAS_CROP", {}))
         inner_rect = (0,0,frame_c0.shape[1], frame_c0.shape[0])
         if CONFIG.get("AUTO_INNER_DETECT", True):
-            inner_rect = _auto_inner_rect_edges(frame_c0, CONFIG.get("AUTO_INNER_MAX_SHRINK", 0.10))
+            inner_rect = _auto_inner_rect_edges(frame_c0, CONFIG.get("AUTO_INNER_MAX_SHRINK", 0.12))
         x0i,y0i,x1i,y1i = inner_rect
         probe_cropped = frame_c0[y0i:y1i, x0i:x1i]
         v_h, v_w = probe_cropped.shape[:2]
 
         masks = tile_border_ring_mask(v_h, v_w, R, C, border_px=8)
-        rois = tile_namebar_rois(v_h, v_w, R, C,
-                                 left_frac=float(CONFIG["LABEL_LEFT_FRAC"]),
-                                 height_frac=float(CONFIG["LABEL_HEIGHT_FRAC"]))
+        top_rois, bot_rois = tile_namebar_rois_dual(
+            v_h, v_w, R, C,
+            left_frac=float(CONFIG["LABEL_LEFT_FRAC"]),
+            top_frac=float(CONFIG["LABEL_TOP_FRAC"]),
+            bottom_frac=float(CONFIG["LABEL_BOTTOM_FRAC"]),
+        )
 
         events: List[TileEvent] = []; label_samples = {i: [] for i in range(R*C)}
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
@@ -444,16 +456,24 @@ def detect_highlight_series(video_path: Path, fps_sample: float, do_ocr: bool,
             events.append(TileEvent(t, tile_idx))
 
             if do_ocr and pytesseract is not None:
-                x0,y0,x1,y1 = rois[tile_idx]
-                band = frame_in[y0:y1, x0:x1]
-                band = cv2.resize(band, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
-                gray = cv2.cvtColor(band, cv2.COLOR_BGR2GRAY)
-                gray = cv2.equalizeHist(gray)
-                # adaptive threshold helps on dark bar / light text
-                bin_img = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                                cv2.THRESH_BINARY, 35, 11)
-                raw_txt = pytesseract.image_to_string(bin_img, config=str(CONFIG["TESS_CONFIG"])).strip()
-                candidate = clean_ocr_name(raw_txt)
+                # try TOP then BOTTOM; keep the better/longer plausible result
+                def _read_roi(x0,y0,x1,y1):
+                    roi = frame_in[y0:y1, x0:x1]
+                    roi = cv2.resize(roi, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+                    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+                    gray = cv2.equalizeHist(gray)
+                    bin_img = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                                    cv2.THRESH_BINARY, 35, 11)
+                    raw = pytesseract.image_to_string(bin_img, config=str(CONFIG["TESS_CONFIG"])).strip()
+                    return clean_ocr_name(raw)
+
+                x0t,y0t,x1t,y1t = top_rois[tile_idx]
+                x0b,y0b,x1b,y1b = bot_rois[tile_idx]
+                cand_t = _read_roi(x0t,y0t,x1t,y1t)
+                cand_b = _read_roi(x0b,y0b,x1b,y1b)
+
+                # choose one
+                candidate = cand_t if (len(cand_t) >= len(cand_b)) else cand_b
                 if candidate:
                     label_samples[tile_idx].append(candidate)
 
