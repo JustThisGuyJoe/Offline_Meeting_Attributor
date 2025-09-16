@@ -394,7 +394,7 @@ def detect_highlight_series(video_path: Path, fps_sample: float, do_ocr: bool,
 
     for (R,C) in grids:
         log(f"[Visual] Trying grid {R}x{C}")
-        # size the cropped canvas and inner ROI from a probe frame
+
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
         ok_probe, probe = cap.read()
         if not ok_probe or probe is None:
@@ -402,13 +402,15 @@ def detect_highlight_series(video_path: Path, fps_sample: float, do_ocr: bool,
         frame_c0, _ = _crop_canvas(probe, CONFIG.get("CANVAS_CROP", {}))
         inner_rect = (0,0,frame_c0.shape[1], frame_c0.shape[0])
         if CONFIG.get("AUTO_INNER_DETECT", True):
-            inner_rect = _auto_inner_rect(frame_c0, CONFIG.get("AUTO_INNER_MAX_SHRINK", 0.20))
+            inner_rect = _auto_inner_rect_edges(frame_c0, CONFIG.get("AUTO_INNER_MAX_SHRINK", 0.10))
         x0i,y0i,x1i,y1i = inner_rect
         probe_cropped = frame_c0[y0i:y1i, x0i:x1i]
         v_h, v_w = probe_cropped.shape[:2]
 
         masks = tile_border_ring_mask(v_h, v_w, R, C, border_px=8)
-        rois = tile_bottom_label_roi(v_h, v_w, R, C, band_fraction=0.20)
+        rois = tile_namebar_rois(v_h, v_w, R, C,
+                                 left_frac=float(CONFIG["LABEL_LEFT_FRAC"]),
+                                 height_frac=float(CONFIG["LABEL_HEIGHT_FRAC"]))
 
         events: List[TileEvent] = []; label_samples = {i: [] for i in range(R*C)}
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
@@ -420,7 +422,6 @@ def detect_highlight_series(video_path: Path, fps_sample: float, do_ocr: bool,
             if f_idx % step != 0:
                 f_idx += 1; continue
 
-            # crop UI bars then inner ROI
             frame_c, _ = _crop_canvas(frame, CONFIG.get("CANVAS_CROP", {}))
             frame_in = frame_c[y0i:y1i, x0i:x1i]
 
@@ -432,10 +433,13 @@ def detect_highlight_series(video_path: Path, fps_sample: float, do_ocr: bool,
             if do_ocr and pytesseract is not None:
                 x0,y0,x1,y1 = rois[tile_idx]
                 band = frame_in[y0:y1, x0:x1]
-                band = cv2.resize(band, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
+                band = cv2.resize(band, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
                 gray = cv2.cvtColor(band, cv2.COLOR_BGR2GRAY)
-                gray = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)[1]
-                raw_txt = pytesseract.image_to_string(gray, config="--psm 6").strip()
+                gray = cv2.equalizeHist(gray)
+                # adaptive threshold helps on dark bar / light text
+                bin_img = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                                cv2.THRESH_BINARY, 35, 11)
+                raw_txt = pytesseract.image_to_string(bin_img, config=str(CONFIG["TESS_CONFIG"])).strip()
                 candidate = clean_ocr_name(raw_txt)
                 if candidate:
                     label_samples[tile_idx].append(candidate)
@@ -449,7 +453,6 @@ def detect_highlight_series(video_path: Path, fps_sample: float, do_ocr: bool,
             if processed % 50 == 0:
                 log(f"[Visual] Grid {R}x{C}: sampled {processed} frames...")
 
-        # stability & best-grid update
         same_runs = sum(1 for i in range(1, len(events)) if events[i].tile_idx == events[i-1].tile_idx)
         stability = same_runs / max(1, len(events))
         log(f"[Visual] Grid {R}x{C} stability={stability:.3f} (samples={len(events)}) in {time.time()-t0:.1f}s")
@@ -459,13 +462,17 @@ def detect_highlight_series(video_path: Path, fps_sample: float, do_ocr: bool,
             best_events = events
             best_labels = label_samples
 
-    # identities from best grid
+    if best_grid is None or best_events is None or best_labels is None:
+        cap.release(); raise RuntimeError("Visual pass found no samples; check FORCE_GRID/CANVAS_CROP.")
+
     identities: Dict[int, TileIdentity] = {}
     R, C = best_grid
     for idx in range(R*C):
         samples = best_labels.get(idx, [])
-        raw = "" if not samples else str(np.unique(np.array(samples), return_counts=True)[0]
-                                         [int(np.argmax(np.unique(np.array(samples), return_counts=True)[1]))])
+        raw = ""
+        if samples:
+            vals, cnts = np.unique(np.array(samples), return_counts=True)
+            raw = str(vals[int(np.argmax(cnts))])
         identities[idx] = TileIdentity(idx, raw, "")
     cap.release()
     log(f"[Visual] Selected grid: {R}x{C} (stability={best_score:.3f})")
