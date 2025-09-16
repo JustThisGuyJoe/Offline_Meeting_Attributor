@@ -665,10 +665,8 @@ def _save_grid_preview(video_path: Path, grid: Tuple[int,int], out_path: Path, s
                         cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255,255,255), 2, cv2.LINE_AA)
     cv2.imwrite(str(out_path), frame_c)
 
-# NEW: helper to write a tile-activity CSV (approx “talk time” per tile)
 def _write_tile_activity_csv(events: List["TileEvent"], grid: Tuple[int,int], out_csv: Path) -> None:
-    if not events:
-        return
+    if not events: return
     totals: Dict[int, float] = {}
     for i in range(len(events)-1):
         t0, t1 = events[i].t, events[i+1].t
@@ -764,7 +762,6 @@ def main(argv=None):
     R, C = grid
     log(f"[Visual] Events: {len(events)}, Grid: {R}x{C}")
 
-    # grid preview + tile activity aids
     base = vis_path.stem + "_fused"
     preview_path = out_dir / f"{base}_grid_preview.jpg"
     mid_t = events[len(events)//2].t if events else 0.0
@@ -775,8 +772,10 @@ def main(argv=None):
     _write_tile_activity_csv(events, grid, activity_csv)
     log(f"[OUT] Tile activity: {activity_csv}")
 
+    # OCR → ICS mapping (logs per tile)
     identities = map_identities_to_ics(identities, attendees)
 
+    # Alignment and attribution
     t_vis0 = first_stable_highlight_time(events) or 0.0
     t_aud0 = stt_segments[0].start
     initial = t_vis0 - t_aud0
@@ -786,7 +785,6 @@ def main(argv=None):
     times_arr = np.array([ev.t for ev in events], dtype=np.float32)
     tiles_arr = np.array([ev.tile_idx for ev in events], dtype=np.int16)
 
-    # Attribution (apply overrides first)
     overrides = cfg.get("TILE_NAME_OVERRIDES", {}) or {}
     attributed: List[Tuple[str,float,float,str]] = []
     for seg in stt_segments:
@@ -801,12 +799,8 @@ def main(argv=None):
     write_outputs(vis_path, aud_src, ics_path, out_dir, temp_dir, final_lines, attendees, identities, best_offset, len(stt_segments), (R,C), "success")
     log(f"[DONE] Attributed lines: {len(final_lines)}")
 
-    # prevent clobbering success files on process exit
     _emergency["enabled"] = False
     log("[Success] Final outputs written; emergency atexit disabled.")
-    # Optional: release model only after success writes
-    # global _WHISPER_MODEL; _WHISPER_MODEL = None; gc.collect()
-
     close_log()
     return 0
 
