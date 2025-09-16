@@ -511,13 +511,13 @@ def refine_offset_grid(events: List[TileEvent], stt: List[STTSegment], initial_o
     return best_off
 
 def map_identities_to_ics(identities: Dict[int, TileIdentity], attendees: List[Attendee]) -> Dict[int, TileIdentity]:
+    cutoff = int(CONFIG.get("FUZZ_CUTOFF", 78))
     for idx, ident in identities.items():
         raw = (ident.label_raw or "").strip()
-        if not _is_plausible_person_name(raw):
-            identities[idx] = TileIdentity(idx, raw, "")
-            continue
-        mapped = strict_map_to_ics(raw, attendees, cutoff=88)
+        mapped = strict_map_to_ics(raw, attendees, cutoff=cutoff) if raw else ""
         identities[idx] = TileIdentity(idx, raw, mapped)
+        if raw or mapped:
+            log(f"[ID] Tile{idx+1}: OCR='{raw}' -> ICS='{mapped or ''}'")
     return identities
 
 def merge_consecutive_segments(attributed: List[Tuple[str,float,float,str]]) -> List[Tuple[str,float,float,str]]:
@@ -542,10 +542,10 @@ def pick_inputs_with_gui(cfg: dict) -> dict:
     from tkinter import filedialog
     root=tk.Tk(); root.withdraw()
     if cfg["VISUAL_VIDEO"] is None:
-        cfg["VISUAL_VIDEO"] = Path(filedialog.askopenfilename(title="Select Zoom screen recording (visual only)",
+        cfg["VISUAL_VIDEO"] = Path(filedialog.askopenfilename(title="Select Zoom/Teams screen recording (visual)",
             filetypes=[("Video","*.mp4 *.mov *.mkv *.avi *.webm")]))
     if cfg["AUDIO_SOURCE"] is None:
-        cfg["AUDIO_SOURCE"] = Path(filedialog.askopenfilename(title="Select audio source (video w/ audio OR audio)",
+        cfg["AUDIO_SOURCE"] = Path(filedialog.askopenfilename(title="Select audio source (video OR audio)",
             filetypes=[("Media","*.mp4 *.mov *.mkv *.avi *.webm *.wav *.m4a *.mp3 *.aac *.flac *.ogg *.opus")]))
     if cfg["ICS_FILE"] is None:
         cfg["ICS_FILE"] = Path(filedialog.askopenfilename(title="Select .ics invite",
