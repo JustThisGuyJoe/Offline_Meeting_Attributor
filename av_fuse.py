@@ -533,9 +533,6 @@ def pick_inputs_with_gui(cfg: dict) -> dict:
             filetypes=[("iCalendar","*.ics")]))
     if cfg["WORK_DIR"] is None:
         cfg["WORK_DIR"] = Path(filedialog.askdirectory(title="Select Working Folder (will create out/ and temp/)"))
-        # Trick: if you prefer a directory chooser:
-        # cfg["WORK_DIR"] = Path(filedialog.askdirectory(title="Select Working Folder"))
-        # but keep the above if your environment blocks askdirectory dialogs
     root.destroy(); return cfg
 
 def write_outputs(vis_path: Path, aud_src: Path, ics_path: Optional[Path],
