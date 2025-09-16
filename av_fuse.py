@@ -597,7 +597,6 @@ def _atexit_emergency_writer():
         if not (vis_path and out_dir and stt_segments):
             return
 
-        # if outputs already present, do nothing
         base = vis_path.stem + "_fused"
         diag_path = out_dir / f"{base}_diagnostics.json"
         if diag_path.exists():
@@ -609,7 +608,6 @@ def _atexit_emergency_writer():
             except Exception:
                 pass
 
-        # otherwise write STT-only fallback
         lines = [f"Unknown: {s.text}" for s in stt_segments]
         write_outputs(vis_path, aud_src, ics_path, out_dir, temp_dir,
                       lines, attendees, {}, 0.0, len(stt_segments), None, "stt_only")
@@ -637,7 +635,6 @@ def ensure_audio_ready(aud_src: Path, temp_dir: Path) -> Path:
     log(f"[Audio] WAV ready")
     return out_wav
 
-# NEW: helper to save a grid preview image with tile indices
 def _save_grid_preview(video_path: Path, grid: Tuple[int,int], out_path: Path, sample_time_s: Optional[float] = None) -> None:
     cap = cv2.VideoCapture(str(video_path))
     if sample_time_s is not None:
@@ -652,7 +649,7 @@ def _save_grid_preview(video_path: Path, grid: Tuple[int,int], out_path: Path, s
         return
     frame_c, _ = _crop_canvas(frame, CONFIG.get("CANVAS_CROP", {}))
     if CONFIG.get("AUTO_INNER_DETECT", True):
-        x0,y0,x1,y1 = _auto_inner_rect(frame_c, CONFIG.get("AUTO_INNER_MAX_SHRINK", 0.20))
+        x0,y0,x1,y1 = _auto_inner_rect_edges(frame_c, CONFIG.get("AUTO_INNER_MAX_SHRINK", 0.10))
         frame_c = frame_c[y0:y1, x0:x1]
 
     R, C = grid
