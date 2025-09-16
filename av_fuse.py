@@ -385,42 +385,66 @@ def detect_highlight_series(video_path: Path, fps_sample: float, do_ocr: bool,
 
     for (R,C) in grids:
         log(f"[Visual] Trying grid {R}x{C}")
+        # read one fresh frame to size the cropped canvas
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        ok_probe, probe = cap.read()
+        if not ok_probe or probe is None:
+            cap.release(); raise RuntimeError("Opened video, but probe read failed")
+        probe_cropped, _off = _crop_canvas(probe, CONFIG.get("CANVAS_CROP", {}))
+        v_h, v_w = probe_cropped.shape[:2]
+
         masks = tile_border_ring_mask(v_h, v_w, R, C, border_px=8)
         rois = tile_bottom_label_roi(v_h, v_w, R, C, band_fraction=0.20)
+
         events: List[TileEvent] = []; label_samples = {i: [] for i in range(R*C)}
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
         processed=0; f_idx=0; t0=time.time(); snap=0
+
         while True:
             ok, frame = cap.read()
             if not ok: break
-            if f_idx % step != 0: f_idx += 1; continue
-            mask_blue = hsv_blue_mask(frame)
-            scores = [int(cv2.countNonZero(cv2.bitwise_and(mask_blue, m))) for m in masks]
+            if f_idx % step != 0:
+                f_idx += 1; continue
+
+            # NEW: crop UI bars before analysis
+            frame_c, _off = _crop_canvas(frame, CONFIG.get("CANVAS_CROP", {}))
+            mask_bord = highlight_mask(frame_c)
+
+            # score per tile ring
+            scores = [int(cv2.countNonZero(cv2.bitwise_and(mask_bord, m))) for m in masks]
             tile_idx = int(np.argmax(scores)); t = f_idx / v_fps
             events.append(TileEvent(t, tile_idx))
+
             if do_ocr and pytesseract is not None:
                 x0,y0,x1,y1 = rois[tile_idx]
-                band = frame[y0:y1, x0:x1]
+                band = frame_c[y0:y1, x0:x1]
                 band = cv2.resize(band, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
                 gray = cv2.cvtColor(band, cv2.COLOR_BGR2GRAY)
                 gray = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)[1]
-                txt = pytesseract.image_to_string(gray, config="--psm 6").strip()
-                txt = re.sub(r"\s+", " ", txt)
-                if txt: label_samples[tile_idx].append(txt)
-            if debug_snapshots and (processed % max(1,snapshot_every) == 0):
+                raw_txt = pytesseract.image_to_string(gray, config="--psm 6").strip()
+                candidate = clean_ocr_name(raw_txt)
+                if candidate:
+                    label_samples[tile_idx].append(candidate)
+
+            if debug_snapshots and (processed % max(1, snapshot_every) == 0):
                 try:
-                    cv2.imwrite(str((temp_dir / f"debug_{R}x{C}_{snap:04d}.jpg")), frame); snap += 1
+                    cv2.imwrite(str((temp_dir / f"debug_{R}x{C}_{snap:04d}.jpg")), frame_c); snap += 1
                 except Exception: pass
+
             f_idx += 1; processed += 1
             if processed % 50 == 0:
                 log(f"[Visual] Grid {R}x{C}: sampled {processed} frames...")
 
         same_runs = sum(1 for i in range(1, len(events)) if events[i].tile_idx == events[i-1].tile_idx)
-        stability = same_runs / max(1,len(events))
+        stability = same_runs / max(1, len(events))
         log(f"[Visual] Grid {R}x{C} stability={stability:.3f} (samples={len(events)}) in {time.time()-t0:.1f}s")
         if stability > best_score:
-            best_score = stability; best_grid=(R,C); best_events=events; best_labels=label_samples
+            best_score = stability
+            best_grid = (R, C)
+            best_events = events
+            best_labels = label_samples
 
+    # ---- after trying all grids, we pick identities using the chosen grid ----
     identities: Dict[int, TileIdentity] = {}
     R, C = best_grid
     for idx in range(R*C):
