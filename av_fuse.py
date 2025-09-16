@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-# av_fuse.py — V1.0.6
+# av_fuse.py — V1.0.8
 #
-# Fixes vs V1.0.5:
-# - Keep Whisper model alive globally to avoid CUDA/CTranslate2 destructor crashes after STT.
-# - Provisional STT-only write happens immediately after STT (then upgrade on success).
-# - atexit emergency writer remains as last resort.
+# Changes vs V1.0.7:
+# - Normalize ICS attendee names from emails (e.g., "first.last@..." → "First Last").
+# - Add CONFIG["TILE_NAME_OVERRIDES"] to force-map a tile index to a display name.
+# - Emit a grid preview image with tile indices, and a tile-activity CSV.
+# - Keep OCR name sanitation + strict ICS mapping from V1.0.7.
+# - Preserve provisional writes + atexit emergency writer safeguards.
 #
 from __future__ import annotations
 
-import argparse, atexit, json, math, os, re, subprocess, sys, time, traceback, gc
+import argparse, atexit, json, math, os, re, subprocess, sys, time, traceback, gc, csv
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
