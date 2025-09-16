@@ -184,116 +184,99 @@ def _name_from_email(addr: str) -> str:
         return ""
     return " ".join(w.capitalize() for w in parts[:3])
 
+# ICS parsing with unfolding
 def parse_ics_attendees(p: Path) -> List[Attendee]:
     out: List[Attendee] = []
     if not p or not p.exists(): return out
-    lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()
+    raw_lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()
+    lines = []
+    for ln in raw_lines:
+        if ln.startswith((" ", "\t")) and lines:
+            lines[-1] += ln.lstrip()
+        else:
+            lines.append(ln)
+
     org = ""
-    for ln in lines:
-        L = ln.strip()
+    for s in lines:
+        L = s.strip()
         if L.upper().startswith("ATTENDEE"):
             m1 = re.search(r";CN=([^;:]+)", L, flags=re.I)
             m2 = re.search(r":mailto:([^ \r\n]+)", L, flags=re.I)
             name = (m1.group(1).strip() if m1 else "").replace(r"\,", ",").strip('"')
             email = (m2.group(1).strip() if m2 else "")
-            # Normalize CN when blank or looks like an email
-            if (not name) or ("@" in name):
-                derived = _name_from_email(email or name)
-                if derived:
-                    name = derived
+            if not name or "@" in name:
+                name = _name_from_email(email or name) or name
             out.append(Attendee(name=name, email=email, company=""))
-        elif L.upper().startswith("ORGANIZATION:") or L.upper().startswith("ORG:"):
+        elif L.upper().startswith(("ORGANIZATION:", "ORG:")):
             org = L.split(":",1)[-1].strip()
     if org:
         for a in out:
             if not a.company: a.company = org
     return out
 
-def best_icsonym_match(raw: str, icsonyms: List[str]) -> Optional[str]:
-    if not raw: return None
-    s = re.sub(r"[^A-Za-z0-9@\.\-\' ]+", "", raw).strip()
-    if not s: return None
-    if not icsonyms: return s
-    if process and fuzz:
-        m = process.extractOne(s, icsonyms, scorer=fuzz.WRatio, score_cutoff=72)
-        return m[0] if m else s
-    for can in icsonyms:
-        if s.lower() == can.lower(): return can
-    return s
-
-# --- Name sanity filters for OCR → ICS mapping ---
+# --- OCR/Name sanitation ---
 STOPWORDS = {
-    "inbox", "zoom", "workplace", "screen", "sharing", "snipping", "tool",
-    "client", "secure", "entry", "external", "meeting", "recording",
-    "cod", "windows", "mail", "outlook"
+    "inbox","zoom","workplace","screen","sharing","snipping","tool",
+    "client","secure","entry","external","meeting","recording",
+    "cod","windows","mail","outlook","unverified","verified"
 }
 
-def _is_plausible_person_name(txt: str) -> bool:
-    if not txt:
-        return False
-    s = txt.strip()
-    low = s.lower()
-    if any(w in low for w in STOPWORDS):
-        return False
-    if "@" in s or "|" in s or "#" in s:
-        return False
-    # keep only letters, spaces, hyphens, apostrophes
-    cleaned = re.sub(r"[^A-Za-z \-']", " ", s)
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    if not cleaned:
-        return False
-    tokens = cleaned.split()
-    # typical display names are 2–3 tokens
-    if len(tokens) < 2 or len(tokens) > 3:
-        return False
-    # require tokens to be capitalized words (e.g., "John", "O'Neil")
-    cap_like = sum(1 for t in tokens if re.match(r"^[A-Z][a-z'\-]+$", t))
-    return cap_like >= 2
+def _is_plausible_person_name(tokens: List[str]) -> bool:
+    if not tokens or len(tokens) < int(CONFIG["OCR_MIN_TOKENS"]): return False
+    if len(tokens) > int(CONFIG["OCR_MAX_TOKENS"]): return False
+    # require last token length >=3 (avoid "En Te" from avatar)
+    if len(tokens[-1]) < 3: return False
+    # need at least one token length >=3
+    if all(len(t) < 3 for t in tokens): return False
+    return True
 
 def clean_ocr_name(raw: str) -> str:
-    """Return a cleaned candidate name or '' if it's not plausibly a person name."""
-    if not raw:
-        return ""
-    s = re.sub(r"\s+", " ", raw).strip()
-    if not _is_plausible_person_name(s):
-        return ""
+    if not raw: return ""
+    s = raw
+    # strip bracketed metadata and junk
+    s = re.sub(r"[\(\[].*?[\)\]]", " ", s)
+    s = re.sub(r"@", " ", s)
     s = re.sub(r"[^A-Za-z \-']", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
-    return " ".join(w[0].upper() + w[1:] if w else w for w in s.split(" "))
+    if not s: return ""
+    toks = s.split()
+    # drop all-caps short tokens (avatar initials), and non-titlecase
+    cand = []
+    for t in toks:
+        if t.isupper() and len(t) <= 3:  # "AT", "GE", etc.
+            continue
+        if len(t) == 1:
+            continue
+        t = t[0].upper() + t[1:].lower()
+        if not re.match(r"^[A-Z][a-z'\-]+$", t):
+            continue
+        cand.append(t)
+    if not _is_plausible_person_name(cand):
+        return ""
+    # prefer First Last
+    cand = cand[:2]
+    return " ".join(cand)
 
-def strict_map_to_ics(ocr_name: str, attendees: List[Attendee], cutoff: int = 88) -> str:
-    """
-    Map a plausible OCR name to an ICS attendee only if:
-      - fuzzy score is high (>= cutoff), AND
-      - both first and last tokens from OCR appear in the ICS name.
-    Otherwise return '' (decline mapping).
-    """
-    if not ocr_name or not attendees:
-        return ""
+def strict_map_to_ics(ocr_name: str, attendees: List[Attendee], cutoff: int = 78) -> str:
+    if not ocr_name or not attendees: return ""
     icsonyms = [a.name for a in attendees if a.name]
-    if not icsonyms:
-        return ""
+    if not icsonyms: return ""
     toks = [t for t in ocr_name.split() if len(t) >= 2]
-    if len(toks) < 2:
-        return ""
+    if len(toks) < 2: return ""
     first, last = toks[0].lower(), toks[-1].lower()
 
-    best = None
-    best_score = -1
+    best = None; best_score = -1
     if process and fuzz:
         cand, score, _ = process.extractOne(ocr_name, icsonyms, scorer=fuzz.WRatio)
         best, best_score = cand, score
     else:
         for cand in icsonyms:
             if ocr_name.lower() == cand.lower():
-                best, best_score = cand, 100
-                break
-
-    if not best or best_score < cutoff:
-        return ""
+                best, best_score = cand, 100; break
+    if not best or best_score < cutoff: return ""
 
     btoks = [t.lower() for t in re.findall(r"[A-Za-z]+", best)]
-    if first in btoks and last in btoks:
+    if (first in btoks and last in btoks):
         return best
     return ""
 
@@ -373,12 +356,14 @@ def tile_border_ring_mask(h: int, w: int, rows: int, cols: int, border_px: int =
             masks.append(tile)
     return masks
 
-def tile_bottom_label_roi(h: int, w: int, rows: int, cols: int, band_fraction: float=0.18):
+# ---- name-bar ROI: bottom-left corner inside each tile ----
+def tile_namebar_rois(h: int, w: int, rows: int, cols: int, left_frac: float, height_frac: float) -> List[Tuple[int,int,int,int]]:
     rois = []; th = h // rows; tw = w // cols
     for r in range(rows):
         for c in range(cols):
-            y0 = r*th + int(th*(1.0 - band_fraction)); y1 = min((r+1)*th, h)
-            x0 = c*tw; x1 = min((c+1)*tw, w); rois.append((x0,y0,x1,y1))
+            y1 = min((r+1)*th, h); y0 = max(r*th, int(y1 - th*height_frac))
+            x0 = c*tw; x1 = min((c+1)*tw, int(c*tw + tw*left_frac))
+            rois.append((x0,y0,x1,y1))
     return rois
 
 def _open_video_with_backoffs(path: Path):
