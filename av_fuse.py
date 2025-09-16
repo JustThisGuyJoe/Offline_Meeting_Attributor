@@ -676,7 +676,6 @@ def _save_grid_preview(video_path: Path, grid: Tuple[int,int], out_path: Path, s
     if sample_time_s is not None:
         cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, float(sample_time_s))*1000.0)
     else:
-        # fallback: 20% into the video
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
         if total_frames > 0:
             cap.set(cv2.CAP_PROP_POS_FRAMES, int(total_frames*0.2))
