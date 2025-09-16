@@ -396,31 +396,41 @@ def write_outputs(vis_path: Path, aud_src: Path, ics_path: Optional[Path],
     out_json.write_text(json.dumps(diag, indent=2), encoding="utf-8")
     log(f"[OUT] Transcript:  {out_txt}")
     log(f"[OUT] Diagnostics: {out_json}")
-    return out_txt, out_json
 
-# ===== atexit emergency writer =====
-_emergency = {
-    "enabled": False,
-    "vis_path": None,
-    "aud_src": None,
-    "ics_path": None,
-    "out_dir": None,
-    "temp_dir": None,
-    "attendees": [],
-    "stt_segments": None,  # List[STTSegment]
-}
+# ---- atexit emergency writer ----
+_emergency = {"enabled": False, "vis_path": None, "aud_src": None, "ics_path": None,
+              "out_dir": None, "temp_dir": None, "attendees": [], "stt_segments": None}
 
 def _atexit_emergency_writer():
     try:
         if not _emergency["enabled"]:
             return
-        vis_path = _emergency["vis_path"]; out_dir = _emergency["out_dir"]; temp_dir = _emergency["temp_dir"]
-        aud_src  = _emergency["aud_src"];  ics_path = _emergency["ics_path"]; attendees = _emergency["attendees"]
+        vis_path = _emergency["vis_path"]
+        out_dir  = _emergency["out_dir"]
+        temp_dir = _emergency["temp_dir"]
+        aud_src  = _emergency["aud_src"]
+        ics_path = _emergency["ics_path"]
+        attendees = _emergency["attendees"]
         stt_segments = _emergency["stt_segments"]
         if not (vis_path and out_dir and stt_segments):
             return
+
+        # if outputs already present, do nothing
+        base = vis_path.stem + "_fused"
+        diag_path = out_dir / f"{base}_diagnostics.json"
+        if diag_path.exists():
+            try:
+                st = json.loads(diag_path.read_text(encoding="utf-8")).get("status", "")
+                if st in {"success", "stt_only_provisional"}:
+                    log("[atexit] Outputs already present; skipping emergency write.")
+                    return
+            except Exception:
+                pass
+
+        # otherwise write STT-only fallback
         lines = [f"Unknown: {s.text}" for s in stt_segments]
-        write_outputs(vis_path, aud_src, ics_path, out_dir, temp_dir, lines, attendees, {}, 0.0, len(stt_segments), None, status="stt_only")
+        write_outputs(vis_path, aud_src, ics_path, out_dir, temp_dir,
+                      lines, attendees, {}, 0.0, len(stt_segments), None, "stt_only")
         log("[atexit] Wrote emergency STT-only outputs.")
     except Exception as ex:
         elog("[atexit] Emergency write failed: " + str(ex))
