@@ -682,7 +682,7 @@ def _save_grid_preview(video_path: Path, grid: Tuple[int,int], out_path: Path, s
         return
     frame_c, _ = _crop_canvas(frame, CONFIG.get("CANVAS_CROP", {}))
     if CONFIG.get("AUTO_INNER_DETECT", True):
-        x0,y0,x1,y1 = _auto_inner_rect_edges(frame_c, CONFIG.get("AUTO_INNER_MAX_SHRINK", 0.10))
+        x0,y0,x1,y1 = _auto_inner_rect_edges(frame_c, CONFIG.get("AUTO_INNER_MAX_SHRINK", 0.12))
         frame_c = frame_c[y0:y1, x0:x1]
 
     R, C = grid
