@@ -575,7 +575,4 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except Exception as ex:
-        elog("[FATAL] Unhandled exception: " + str(ex))
-        traceback.print_exc()
-        close_log()
-        sys.exit(1)
+        elog("[FATAL] " + str(ex)); traceback.print_exc(); close_log(); sys.exit(1)
