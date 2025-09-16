@@ -789,7 +789,7 @@ def main(argv=None):
         close_log(); return 6
 
     if not events:
-        log("[Visual] No highlight events — keeping STT-only.")
+        log("[Visual] No highlight events — keeping STT-only.]")
         close_log(); return 3
 
     R, C = grid
