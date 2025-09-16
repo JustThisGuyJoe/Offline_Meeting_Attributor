@@ -152,25 +152,21 @@ def _auto_inner_rect_edges(frame_c: np.ndarray, max_shrink_pct: float = 0.12) ->
     gray = cv2.cvtColor(frame_c, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (3,3), 0.8)
     edges = cv2.Canny(gray, 40, 120)
-    # make borders continuous
     k = cv2.getStructuringElement(cv2.MORPH_RECT, (7,7))
     edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, k, iterations=2)
 
-    # find the largest contour (likely the gallery block)
     cnts,_ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not cnts:
         return 0, 0, w, h
     cnt = max(cnts, key=cv2.contourArea)
     x,y,ww,hh = cv2.boundingRect(cnt)
 
-    # restrict shrink
     max_dx = int(w * max_shrink_pct); max_dy = int(h * max_shrink_pct)
     x0 = max(0, min(x, max_dx))
     y0 = max(0, min(y, max_dy))
     x1 = min(w, max(x+ww, w - max_dx))
     y1 = min(h, max(y+hh, h - max_dy))
 
-    # ensure reasonable area
     if (x1-x0) < w*0.6 or (y1-y0) < h*0.5:
         return 0, 0, w, h
     return x0, y0, x1, y1
@@ -217,68 +213,83 @@ def parse_ics_attendees(p: Path) -> List[Attendee]:
     return out
 
 # --- OCR/Name sanitation ---
-STOPWORDS = {
-    "inbox","zoom","workplace","screen","sharing","snipping","tool",
-    "client","secure","entry","external","meeting","recording",
-    "cod","windows","mail","outlook","unverified","verified"
-}
-
 def _is_plausible_person_name(tokens: List[str]) -> bool:
     if not tokens or len(tokens) < int(CONFIG["OCR_MIN_TOKENS"]): return False
     if len(tokens) > int(CONFIG["OCR_MAX_TOKENS"]): return False
-    # require last token length >=3 (avoid "En Te" from avatar)
+    # Last token must be >=3 (surname anchor)
     if len(tokens[-1]) < 3: return False
-    # need at least one token length >=3
+    # at least one token length >=3 overall
     if all(len(t) < 3 for t in tokens): return False
     return True
 
 def clean_ocr_name(raw: str) -> str:
     if not raw: return ""
     s = raw
-    # strip bracketed metadata and junk
-    s = re.sub(r"[\(\[].*?[\)\]]", " ", s)
+    s = re.sub(r"[\(\[].*?[\)\]]", " ", s)   # remove "(Unverified)" etc.
     s = re.sub(r"@", " ", s)
     s = re.sub(r"[^A-Za-z \-']", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     if not s: return ""
     toks = s.split()
-    # drop all-caps short tokens (avatar initials), and non-titlecase
+
+    # Drop tokens that look like UI junk or avatar initials
     cand = []
     for t in toks:
-        if t.isupper() and len(t) <= 3:  # "AT", "GE", etc.
+        # all-caps 2–3 letters like "AT", "GE"
+        if t.isupper() and 1 < len(t) <= 3:
             continue
+        # 1-char tokens
         if len(t) == 1:
             continue
+        # normalize to Titlecase
         t = t[0].upper() + t[1:].lower()
         if not re.match(r"^[A-Z][a-z'\-]+$", t):
             continue
         cand.append(t)
+
     if not _is_plausible_person_name(cand):
         return ""
-    # prefer First Last
+    # Prefer at most First Last
     cand = cand[:2]
     return " ".join(cand)
 
+def _token_sim(a: str, b: str) -> int:
+    """0..100 similarity for single tokens."""
+    if fuzz:
+        return int(fuzz.ratio(a.lower(), b.lower()))
+    return 100 if a.lower() == b.lower() else 0
+
 def strict_map_to_ics(ocr_name: str, attendees: List[Attendee], cutoff: int = 78) -> str:
+    """
+    Map OCR name → ICS roster with two gates:
+      1) Overall fuzzy match >= cutoff (WRatio).
+      2) Token check: last-name token must match >= TOKEN_FUZZ to some ICS token,
+         and at least one other token must also match >= TOKEN_FUZZ.
+    This allows 'Joe Johnson' → 'Joseph Johnson', but rejects random collisions.
+    """
     if not ocr_name or not attendees: return ""
     icsonyms = [a.name for a in attendees if a.name]
     if not icsonyms: return ""
-    toks = [t for t in ocr_name.split() if len(t) >= 2]
-    if len(toks) < 2: return ""
-    first, last = toks[0].lower(), toks[-1].lower()
 
-    best = None; best_score = -1
+    toks = [t for t in re.findall(r"[A-Za-z]+", ocr_name)]
+    if len(toks) < 2: return ""
+    o_first, o_last = toks[0], toks[-1]
+
+    best, score = None, -1
     if process and fuzz:
-        cand, score, _ = process.extractOne(ocr_name, icsonyms, scorer=fuzz.WRatio)
-        best, best_score = cand, score
+        cand, sc, _ = process.extractOne(ocr_name, icsonyms, scorer=fuzz.WRatio)
+        best, score = cand, sc
     else:
         for cand in icsonyms:
             if ocr_name.lower() == cand.lower():
-                best, best_score = cand, 100; break
-    if not best or best_score < cutoff: return ""
+                best, score = cand, 100; break
+    if not best or score < cutoff:
+        return ""
 
-    btoks = [t.lower() for t in re.findall(r"[A-Za-z]+", best)]
-    if (first in btoks and last in btoks):
+    btoks = re.findall(r"[A-Za-z]+", best)
+    last_ok = max((_token_sim(o_last, b) for b in btoks), default=0) >= int(CONFIG["TOKEN_FUZZ"])
+    other_ok = max((_token_sim(o_first, b) for b in btoks), default=0) >= int(CONFIG["TOKEN_FUZZ"])
+    if last_ok and other_ok:
         return best
     return ""
 
