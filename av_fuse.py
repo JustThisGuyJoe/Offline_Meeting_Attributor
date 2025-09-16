@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-# av_fuse.py — V1.1.0
+# av_fuse.py — V1.1.1
 
 from __future__ import annotations
 
-import argparse, atexit, json, math, os, re, subprocess, sys, time, traceback, gc, csv
+import argparse, atexit, json, math, os, re, subprocess, sys, time, traceback, csv
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
