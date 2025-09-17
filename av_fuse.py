@@ -597,21 +597,50 @@ def ensure_work_dirs(base: Path):
     return out_dir, temp_dir
 
 def pick_inputs_with_gui(cfg: dict) -> dict:
+    """
+    Opens file/folder pickers for any *missing* inputs.
+    Safe even if cfg lacks expected keys thanks to setdefault().
+    """
     import tkinter as tk
     from tkinter import filedialog
-    root=tk.Tk(); root.withdraw()
+
+    # Seed defaults so KeyError can't happen
+    cfg.setdefault("VISUAL_VIDEO", None)
+    cfg.setdefault("AUDIO_SOURCE", None)
+    cfg.setdefault("ICS_FILE", None)
+    cfg.setdefault("WORK_DIR", None)
+
+    root = tk.Tk()
+    root.withdraw()
+
     if cfg["VISUAL_VIDEO"] is None:
-        cfg["VISUAL_VIDEO"] = Path(filedialog.askopenfilename(title="Select Zoom/Teams screen recording (visual)",
-            filetypes=[("Video","*.mp4 *.mov *.mkv *.avi *.webm")]))
+        sel = filedialog.askopenfilename(
+            title="Select Zoom/Teams screen recording (visual)",
+            filetypes=[("Video","*.mp4 *.mov *.mkv *.avi *.webm")]
+        )
+        cfg["VISUAL_VIDEO"] = Path(sel) if sel else None
+
     if cfg["AUDIO_SOURCE"] is None:
-        cfg["AUDIO_SOURCE"] = Path(filedialog.askopenfilename(title="Select audio source (video OR audio)",
-            filetypes=[("Media","*.mp4 *.mov *.mkv *.avi *.webm *.wav *.m4a *.mp3 *.aac *.flac *.ogg *.opus")]))
+        sel = filedialog.askopenfilename(
+            title="Select audio source (video OR audio)",
+            filetypes=[("Media","*.mp4 *.mov *.mkv *.avi *.webm *.wav *.m4a *.mp3 *.aac *.flac *.ogg *.opus")]
+        )
+        cfg["AUDIO_SOURCE"] = Path(sel) if sel else None
+
     if cfg["ICS_FILE"] is None:
-        cfg["ICS_FILE"] = Path(filedialog.askopenfilename(title="Select .ics invite",
-            filetypes=[("iCalendar","*.ics")]))
+        sel = filedialog.askopenfilename(
+            title="Select .ics invite",
+            filetypes=[("iCalendar","*.ics")]
+        )
+        cfg["ICS_FILE"] = Path(sel) if sel else None
+
     if cfg["WORK_DIR"] is None:
-        cfg["WORK_DIR"] = Path(filedialog.askdirectory(title="Select Working Folder (will create out/ and temp/)"))
-    root.destroy(); return cfg
+        sel = filedialog.askdirectory(title="Select Working Folder (will create out/ and temp/)")
+        cfg["WORK_DIR"] = Path(sel) if sel else None
+
+    root.destroy()
+    return cfg
+
 
 def write_outputs(vis_path: Path, aud_src: Path, ics_path: Optional[Path],
                   out_dir: Path, temp_dir: Path, lines: List[str],
