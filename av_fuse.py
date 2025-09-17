@@ -765,6 +765,61 @@ def _save_grid_preview(video_path: Path, grid: Tuple[int,int], out_path: Path, s
                         cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255,255,255), 2, cv2.LINE_AA)
     cv2.imwrite(str(out_path), frame_c)
 
+def main(argv=None):
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--nogui", action="store_true", help="Disable GUI pickers; use CONFIG/CLI values only")
+    parser.add_argument("--config", type=str, default="av_fuse.cfg",
+                        help="Path to INI config file (default: av_fuse.cfg)")
+    # preview-only knobs
+    parser.add_argument("--preview-only", action="store_true", help="Only generate grid preview and exit")
+    parser.add_argument("--grid", type=str, help="Override grid, e.g. 3x3")
+    parser.add_argument("--time", type=float, default=None, help="Preview sample time (seconds)")
+    parser.add_argument("--insetx", type=float, help="Inner inset X fraction (negative expands)")
+    parser.add_argument("--insety", type=float, help="Inner inset Y fraction (negative expands)")
+    parser.add_argument("--maxshrink", type=float, help="Max shrink fraction for inner-rect autodetect")
+    parser.add_argument("--crop-top", type=int, help="Canvas crop top pixels")
+    parser.add_argument("--crop-bottom", type=int, help="Canvas crop bottom pixels")
+    parser.add_argument("--crop-left", type=int, help="Canvas crop left pixels")
+    parser.add_argument("--crop-right", type=int, help="Canvas crop right pixels")
+    args, _ = parser.parse_known_args(argv)
+
+    # start with built-ins
+    cfg = dict(CONFIG)
+    for k in ("VISUAL_VIDEO", "AUDIO_SOURCE", "ICS_FILE", "WORK_DIR", "CANVAS_CROP"):
+        cfg.setdefault(k, None)
+    if cfg["CANVAS_CROP"] is None:
+        cfg["CANVAS_CROP"] = dict(CONFIG.get("CANVAS_CROP", {}))
+
+    # load INI if present
+    ini_path = Path(args.config)
+    if ini_path.exists():
+        cfg = load_ini_into_cfg(cfg, ini_path)
+        print(f"[CFG] Loaded {ini_path}")
+
+    # CLI overrides
+    if args.grid:
+        cfg["FORCE_GRID"] = _parse_grid_arg(args.grid)
+    if args.maxshrink is not None:
+        cfg["AUTO_INNER_MAX_SHRINK"] = float(args.maxshrink)
+    if args.insetx is not None:
+        cfg["AUTO_INNER_INSET_X_FRAC"] = float(args.insetx)
+    if args.insety is not None:
+        cfg["AUTO_INNER_INSET_Y_FRAC"] = float(args.insety)
+    if args.crop_top is not None:
+        cfg["CANVAS_CROP"]["top"] = int(args.crop_top)
+    if args.crop_bottom is not None:
+        cfg["CANVAS_CROP"]["bottom"] = int(args.crop_bottom)
+    if args.crop_left is not None:
+        cfg["CANVAS_CROP"]["left"] = int(args.crop_left)
+    if args.crop_right is not None:
+        cfg["CANVAS_CROP"]["right"] = int(args.crop_right)
+
+    # GUI pickers unless disabled
+    if USE_GUI_DEFAULT and not args.nogui:
+        cfg = pick_inputs_with_gui(cfg)
+
+    # (leave the rest of main() as-is: path checks, preview-only short-circuit, pipeline, etc.)
+
 def _write_tile_activity_csv(events: List["TileEvent"], grid: Tuple[int,int], out_csv: Path) -> None:
     if not events: return
     totals: Dict[int, float] = {}
