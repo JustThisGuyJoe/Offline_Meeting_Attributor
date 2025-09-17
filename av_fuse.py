@@ -26,16 +26,12 @@ except Exception:
     WhisperModel = None
 
 CONFIG = {
-    # set these to None to use the GUI pickers
-    "VISUAL_VIDEO": None,
-    "AUDIO_SOURCE": None,
-    "ICS_FILE": None,
-    "WORK_DIR": None,
+    # ... paths omitted ...
 
     # STT
     "WHISPER_MODEL": "medium",
-    "WHISPER_DEVICE": "cuda",       # "cuda" or "cpu"
-    "WHISPER_COMPUTE": "float16",   # "float16" or "int8" (cpu)
+    "WHISPER_DEVICE": "cuda",
+    "WHISPER_COMPUTE": "float16",
 
     # Visual
     "FPS_SAMPLE": 2.0,
@@ -44,7 +40,6 @@ CONFIG = {
     "DEBUG_SNAPSHOTS": False,
     "SNAPSHOT_EVERY": 150,
 
-    # Manual tile -> name overrides (0-based index)
     "TILE_NAME_OVERRIDES": {
         # 4: "Austin Thomas",
         # 8: "JC Nordyke",
@@ -53,24 +48,30 @@ CONFIG = {
     # Crop away global UI bars (pixels)
     "CANVAS_CROP": {"top": 80, "bottom": 80, "left": 0, "right": 0},
 
-    # Force grid (3,3 for Teams). Set to None to let it try [(3,3),(4,4)].
+    # Force Teams grid
     "FORCE_GRID": (3, 3),
 
-    # Auto-detect inner gallery rectangle (handles maximized window vs fullscreen)
+    # Auto-detect inner gallery rectangle
     "AUTO_INNER_DETECT": True,
-    "AUTO_INNER_MAX_SHRINK": 0.12,   # allow up to 12% per side
+    "AUTO_INNER_MAX_SHRINK": 0.20,   # was 0.12 — allow more shrink
+    "AUTO_INNER_INSET_FRAC": 0.02,   # new: after detection, nudge inward 2%
 
-    # OCR: read both TOP-LEFT and BOTTOM-LEFT name bars (avoid avatar initials)
-    "LABEL_LEFT_FRAC": 0.55,         # left portion width inside tile
-    "LABEL_BOTTOM_FRAC": 0.10,       # bottom band height inside tile
-    "LABEL_TOP_FRAC": 0.12,          # top band height inside tile
+    # Allow different inset for X and Y (negative expands)
+    "AUTO_INNER_INSET_X_FRAC": 0.035,   # shrink width a bit more (3.5% each side)
+    "AUTO_INNER_INSET_Y_FRAC": -0.015,  # EXPAND height slightly (-1.5% each side)
+
+    # OCR: use a smaller left band & thinner top/bottom to avoid avatar initials
+    "LABEL_LEFT_FRAC": 0.48,         # was 0.55
+    "LABEL_BOTTOM_FRAC": 0.09,       # was 0.10
+    "LABEL_TOP_FRAC": 0.10,          # was 0.12
     "OCR_MIN_TOKENS": 2,
     "OCR_MAX_TOKENS": 3,
-    "TESS_CONFIG": "--psm 7 -l eng", # single text line
+    # strong whitelist; single line
+    "TESS_CONFIG": "--psm 7 -l eng -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-' ",
 
     # ICS mapping
-    "FUZZ_CUTOFF": 78,               # overall match
-    "TOKEN_FUZZ": 85,                # per-token similarity requirement
+    "FUZZ_CUTOFF": 78,
+    "TOKEN_FUZZ": 85,
 }
 
 USE_GUI_DEFAULT = True
