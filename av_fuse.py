@@ -740,29 +740,84 @@ def _write_tile_activity_csv(events: List["TileEvent"], grid: Tuple[int,int], ou
         w.writerows(rows)
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(add_help=False); parser.add_argument("--nogui", action="store_true")
-    args,_ = parser.parse_known_args(argv)
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--nogui", action="store_true", help="Disable GUI pickers; use CONFIG/CLI values only")
+    # === new preview-only knobs ===
+    parser.add_argument("--preview-only", action="store_true",
+                        help="Only generate the grid preview image and exit")
+    parser.add_argument("--grid", type=str, help="Override grid, e.g. 3x3")
+    parser.add_argument("--time", type=float, default=None,
+                        help="Preview sample time (seconds). Default: auto (~20%% of video).")
+    parser.add_argument("--insetx", type=float, help="Inner inset X fraction (negative expands)")
+    parser.add_argument("--insety", type=float, help="Inner inset Y fraction (negative expands)")
+    parser.add_argument("--maxshrink", type=float, help="Max shrink fraction for inner-rect autodetect")
+    parser.add_argument("--crop-top", type=int, help="Canvas crop top pixels")
+    parser.add_argument("--crop-bottom", type=int, help="Canvas crop bottom pixels")
+    parser.add_argument("--crop-left", type=int, help="Canvas crop left pixels")
+    parser.add_argument("--crop-right", type=int, help="Canvas crop right pixels")
+    args, _ = parser.parse_known_args(argv)
 
-    cfg = dict(CONFIG)
+    cfg = dict(CONFIG)  # clone
+    # guard against missing keys
+    for k in ("VISUAL_VIDEO", "AUDIO_SOURCE", "ICS_FILE", "WORK_DIR"):
+        cfg.setdefault(k, None)
+    cfg.setdefault("CANVAS_CROP", dict(CONFIG.get("CANVAS_CROP", {})))
+
+    # CLI overrides into cfg/CONFIG
+    if args.grid:
+        cfg["FORCE_GRID"] = _parse_grid_arg(args.grid)
+    if args.maxshrink is not None:
+        cfg["AUTO_INNER_MAX_SHRINK"] = float(args.maxshrink)
+    if args.insetx is not None:
+        cfg["AUTO_INNER_INSET_X_FRAC"] = float(args.insetx)
+    if args.insety is not None:
+        cfg["AUTO_INNER_INSET_Y_FRAC"] = float(args.insety)
+    if args.crop_top is not None:
+        cfg["CANVAS_CROP"]["top"] = int(args.crop_top)
+    if args.crop_bottom is not None:
+        cfg["CANVAS_CROP"]["bottom"] = int(args.crop_bottom)
+    if args.crop_left is not None:
+        cfg["CANVAS_CROP"]["left"] = int(args.crop_left)
+    if args.crop_right is not None:
+        cfg["CANVAS_CROP"]["right"] = int(args.crop_right)
+
+    # GUI pickers (unless --nogui)
     if USE_GUI_DEFAULT and not args.nogui:
         cfg = pick_inputs_with_gui(cfg)
 
-    vis_path = Path(cfg["VISUAL_VIDEO"]) if cfg["VISUAL_VIDEO"] else None
-    aud_src  = Path(cfg["AUDIO_SOURCE"]) if cfg["AUDIO_SOURCE"] else None
-    ics_path = Path(cfg["ICS_FILE"]) if cfg["ICS_FILE"] else None
-    work_dir = Path(cfg["WORK_DIR"]) if cfg["WORK_DIR"] else None
+    vis_path = Path(cfg["VISUAL_VIDEO"]) if cfg.get("VISUAL_VIDEO") else None
+    aud_src  = Path(cfg["AUDIO_SOURCE"]) if cfg.get("AUDIO_SOURCE") else None
+    ics_path = Path(cfg["ICS_FILE"])     if cfg.get("ICS_FILE")     else None
+    work_dir = Path(cfg["WORK_DIR"])     if cfg.get("WORK_DIR")     else None
 
     print("[FILES] Visual:", vis_path or "<none>")
     print("[FILES] Audio: ", aud_src or "<none>")
     print("[FILES] ICS:   ", ics_path or "<none>")
 
-    if not vis_path or not vis_path.exists(): raise FileNotFoundError("Missing VISUAL_VIDEO")
-    if not aud_src or not aud_src.exists():  raise FileNotFoundError("Missing AUDIO_SOURCE")
-    if not work_dir:                         raise FileNotFoundError("Missing WORK_DIR")
+    if not vis_path or not vis_path.exists():
+        raise FileNotFoundError("Missing VISUAL_VIDEO")
+    if not work_dir:
+        raise FileNotFoundError("Missing WORK_DIR")
+
+    # make sure global CONFIG reflects CLI tweaks for preview helpers
+    CONFIG.update(cfg)
 
     out_dir, temp_dir = ensure_work_dirs(work_dir)
-    run_log_path = out_dir / (vis_path.stem + "_run.log"); _open_log_file(run_log_path)
+    run_log_path = out_dir / (vis_path.stem + "_run.log")
+    _open_log_file(run_log_path)
 
+    # ---------- PREVIEW-ONLY SHORT-CIRCUIT ----------
+    if args.preview_only:
+        grid = tuple(cfg.get("FORCE_GRID") or (3, 3))
+        base = vis_path.stem + "_fused"
+        preview_path = out_dir / f"{base}_grid_preview.jpg"
+        _save_grid_preview(vis_path, grid, preview_path, sample_time_s=args.time)
+        log(f"[OUT] Grid preview: {preview_path}")
+        close_log()
+        return 0
+    # ------------------------------------------------
+
+    # ---------- normal pipeline below ----------
     log(f"[Paths] Work: {work_dir}")
     log(f"[Paths] Out:  {out_dir}")
     log(f"[Paths] Temp: {temp_dir}")
