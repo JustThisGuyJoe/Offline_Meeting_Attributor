@@ -856,23 +856,24 @@ def main(argv=None):
 
     wav_path = ensure_audio_ready(aud_src, temp_dir)
 
-    # ---- STT ----
-    stt_segments = transcribe_wav_fwhisper(wav_path, cfg["WHISPER_MODEL"], cfg["WHISPER_DEVICE"], cfg["WHISPER_COMPUTE"])
+    stt_segments = transcribe_wav_fwhisper(
+        wav_path, cfg["WHISPER_MODEL"], cfg["WHISPER_DEVICE"], cfg["WHISPER_COMPUTE"]
+    )
     if not stt_segments:
         log("[STT] No segments — writing empty transcript.")
-        write_outputs(vis_path, aud_src, ics_path, out_dir, temp_dir, [], attendees, {}, 0.0, 0, None, "stt_only")
+        write_outputs(vis_path, aud_src, ics_path, out_dir, temp_dir, [],
+                      attendees, {}, 0.0, 0, None, "stt_only")
         close_log(); return 2
 
-    # enable atexit emergency now that we have STT
     _emergency.update({"enabled": True, "vis_path": vis_path, "aud_src": aud_src, "ics_path": ics_path,
-                       "out_dir": out_dir, "temp_dir": temp_dir, "attendees": attendees, "stt_segments": stt_segments})
+                       "out_dir": out_dir, "temp_dir": temp_dir, "attendees": attendees,
+                       "stt_segments": stt_segments})
 
-    # Provisional write
     provisional_lines = [f"Unknown: {s.text}" for s in stt_segments]
-    write_outputs(vis_path, aud_src, ics_path, out_dir, temp_dir, provisional_lines, attendees, {}, 0.0, len(stt_segments), None, "stt_only_provisional")
+    write_outputs(vis_path, aud_src, ics_path, out_dir, temp_dir,
+                  provisional_lines, attendees, {}, 0.0, len(stt_segments), None, "stt_only_provisional")
     log("[Checkpoint] Provisional transcript+diagnostics written. Proceeding to visual...")
 
-    # ---- VISUAL PREFLIGHT ----
     log("[Visual] Preflight: opening video...")
     cap0 = _open_video_with_backoffs(vis_path)
     if cap0 is None or not cap0.isOpened():
@@ -884,7 +885,6 @@ def main(argv=None):
         close_log(); return 5
     log("[Visual] Preflight OK; starting detection...")
 
-    # ---- VISUAL DETECTION ----
     try:
         events, identities, grid = detect_highlight_series(
             vis_path,
@@ -915,10 +915,8 @@ def main(argv=None):
     _write_tile_activity_csv(events, grid, activity_csv)
     log(f"[OUT] Tile activity: {activity_csv}")
 
-    # OCR → ICS mapping (logs per tile)
     identities = map_identities_to_ics(identities, attendees)
 
-    # Alignment and attribution
     t_vis0 = first_stable_highlight_time(events) or 0.0
     t_aud0 = stt_segments[0].start
     initial = t_vis0 - t_aud0
@@ -939,7 +937,8 @@ def main(argv=None):
 
     attributed = merge_consecutive_segments(attributed)
     final_lines = format_transcript_lines(attributed)
-    write_outputs(vis_path, aud_src, ics_path, out_dir, temp_dir, final_lines, attendees, identities, best_offset, len(stt_segments), (R,C), "success")
+    write_outputs(vis_path, aud_src, ics_path, out_dir, temp_dir, final_lines,
+                  attendees, identities, best_offset, len(stt_segments), (R,C), "success")
     log(f"[DONE] Attributed lines: {len(final_lines)}")
 
     _emergency["enabled"] = False
