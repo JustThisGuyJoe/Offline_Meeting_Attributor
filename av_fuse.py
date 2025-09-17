@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-import argparse, atexit, json, math, os, re, subprocess, sys, time, traceback, csv
+import argparse, atexit, json, math, os, re, subprocess, sys, time, traceback, csv, configparser
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -129,6 +129,18 @@ def is_mono_16k_wav(path: Path) -> bool:
     except Exception:
         pass
     return False
+
+def _parse_grid_arg(s: str) -> Tuple[int,int]:
+    m = re.match(r"^\s*(\d+)\s*[xX]\s*(\d+)\s*$", str(s))
+    if not m:
+        raise ValueError("grid must look like 3x3 or 4x4")
+    return int(m.group(1)), int(m.group(2))
+
+def _getbool(cp: configparser.ConfigParser, sec: str, key: str, default: bool) -> bool:
+    try:
+        return cp.getboolean(sec, key, fallback=default)
+    except Exception:
+        return default
 
 @dataclass
 class Attendee:
