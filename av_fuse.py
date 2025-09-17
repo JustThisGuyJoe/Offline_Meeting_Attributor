@@ -144,32 +144,57 @@ def _crop_canvas(frame: np.ndarray, crop: Dict[str,int]) -> Tuple[np.ndarray, Tu
     x0 = min(max(0, l), w-1); x1 = max(x0+1, w - max(0, r))
     return frame[y0:y1, x0:x1].copy(), (x0, y0)
 
-# edge-based inner gallery detection (conservative)
-def _auto_inner_rect_edges(frame_c: np.ndarray, max_shrink_pct: float = 0.12) -> Tuple[int,int,int,int]:
+def _parse_grid_arg(s: str) -> Tuple[int,int]:
+    m = re.match(r"^\s*(\d+)\s*[xX]\s*(\d+)\s*$", str(s))
+    if not m:
+        raise ValueError("grid must look like 3x3 or 4x4")
+    return int(m.group(1)), int(m.group(2))
+
+def _auto_inner_rect_edges(frame_c: np.ndarray, max_shrink_pct: float = 0.20) -> Tuple[int,int,int,int]:
+    """
+    Find inner gallery rect by edges → largest contour bbox, clamp shrink,
+    then apply *separate* X and Y insets (can be negative to expand).
+    Returns (x0, y0, x1, y1) in pixels, relative to frame_c.
+    """
     h, w = frame_c.shape[:2]
     if h < 200 or w < 200:
         return 0, 0, w, h
 
     gray = cv2.cvtColor(frame_c, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (3,3), 0.8)
+    gray = cv2.GaussianBlur(gray, (3, 3), 0.8)
     edges = cv2.Canny(gray, 40, 120)
-    k = cv2.getStructuringElement(cv2.MORPH_RECT, (7,7))
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
     edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, k, iterations=2)
 
-    cnts,_ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not cnts:
         return 0, 0, w, h
-    cnt = max(cnts, key=cv2.contourArea)
-    x,y,ww,hh = cv2.boundingRect(cnt)
+    x, y, ww, hh = cv2.boundingRect(max(cnts, key=cv2.contourArea))
 
-    max_dx = int(w * max_shrink_pct); max_dy = int(h * max_shrink_pct)
+    # clamp shrink vs full frame
+    max_dx = int(w * float(max_shrink_pct))
+    max_dy = int(h * float(max_shrink_pct))
     x0 = max(0, min(x, max_dx))
     y0 = max(0, min(y, max_dy))
-    x1 = min(w, max(x+ww, w - max_dx))
-    y1 = min(h, max(y+hh, h - max_dy))
+    x1 = min(w, max(x + ww, w - max_dx))
+    y1 = min(h, max(y + hh, h - max_dy))
 
-    if (x1-x0) < w*0.6 or (y1-y0) < h*0.5:
+    # safety: avoid tiny rects
+    if (x1 - x0) < w * 0.6 or (y1 - y0) < h * 0.5:
         return 0, 0, w, h
+
+    # --- anisotropic inset (can be negative = expand) ---
+    x_frac = float(CONFIG.get("AUTO_INNER_INSET_X_FRAC", CONFIG.get("AUTO_INNER_INSET_FRAC", 0.0)))
+    y_frac = float(CONFIG.get("AUTO_INNER_INSET_Y_FRAC", CONFIG.get("AUTO_INNER_INSET_FRAC", 0.0)))
+
+    dx = int((x1 - x0) * x_frac)
+    dy = int((y1 - y0) * y_frac)
+
+    x0 = min(max(0, x0 + dx), w - 2)
+    x1 = max(min(w, x1 - dx), x0 + 2)
+    y0 = min(max(0, y0 + dy), h - 2)
+    y1 = max(min(h, y1 - dy), y0 + 2)
+
     return x0, y0, x1, y1
 
 # Email → friendly name
